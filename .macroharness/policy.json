@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "tool": "read_file",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "ls *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "cat *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "rg *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "grep *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "find *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "head *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "tail *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "wc *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "git status *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "git diff *",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "git log *",
+      "verb": "allow"
+    },
+    {
+      "tool": "write_file",
+      "arg": "*.env",
+      "verb": "deny"
+    },
+    {
+      "tool": "write_file",
+      "arg": "*.pem",
+      "verb": "deny"
+    },
+    {
+      "tool": "*",
+      "arg": "*",
+      "verb": "ask"
+    }
+  ]
+}

@@ -17,9 +17,19 @@ does that loop need before you can leave it running on its own?"
 ```sh
 export DEEPSEEK_API_KEY=sk-...
 
+# Run these two once, so the module resolves from any directory:
+python3 -m venv /tmp/macroharness-venv
+/tmp/macroharness-venv/bin/pip install -e /path/to/macro-harness
+
 mkdir /tmp/scratch && cd /tmp/scratch
-python3 -m macroharness
+/tmp/macroharness-venv/bin/python -m macroharness
 ```
+
+The editable install is what lets the module resolve from a scratch directory;
+without it (or `PYTHONPATH=/path/to/macro-harness`) the package is only
+importable from the repo root. A venv sidesteps the PEP 668 error from a
+Homebrew or otherwise externally-managed Python — on an unmanaged interpreter,
+`pip install -e /path/to/macro-harness` is enough.
 
 The agent is confined to the workspace directory (the current directory by
 default), and its state lives there in `.macroharness/`. Any OpenAI-shaped
