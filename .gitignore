@@ -1,3 +1,18 @@
+# Python bytecode and build output
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Harness runtime state. policy.json and mcp.json are meant to be committed
+# (README "State on disk"); sessions and the trust hash are per-user.
 .macroharness/sessions/
+.macroharness/trusted.json
