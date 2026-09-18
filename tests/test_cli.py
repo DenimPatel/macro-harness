@@ -40,6 +40,14 @@ class BuildTests(unittest.TestCase):
         self.addCleanup(harness.close)
         self.assertEqual(harness.run_user_turn("hi"), "hi")
 
+    def test_main_runs_a_one_shot_prompt_without_the_repl(self):
+        harness, model, out = build_harness(self.root, [assistant("the repo is small")])
+        with mock.patch.object(cli, "build", return_value=harness):
+            self.assertEqual(cli.main(["summarize", "this", "repo"]), 0)
+        self.assertEqual(model.requests[0]["messages"][-1],
+                         {"role": "user", "content": "summarize this repo"})
+        self.assertIn("the repo is small", out.text)
+
     def test_missing_api_key_is_a_clear_error(self):
         os.environ.pop("MACRO_MISSING_KEY", None)
         with self.assertRaises(PolicyError) as caught:

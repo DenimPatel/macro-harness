@@ -35,6 +35,18 @@ The agent is confined to the workspace directory (the current directory by
 default), and its state lives there in `.macroharness/`. Any OpenAI-shaped
 `/chat/completions` endpoint works: change `--base-url` and `--model`.
 
+`mh` is the same entry point as a console script, and a trailing prompt makes it
+one-shot instead of interactive. The workspace is still the current directory, so
+run it from whatever repository you want it to see:
+
+```sh
+# put the bin dir your install used on PATH, once
+export PATH="/tmp/macroharness-venv/bin:$PATH"
+
+mh summarize this repo    # one turn, then exit
+mh                        # no prompt: the REPL
+```
+
 ```
 you> list the files here and tell me what this project is
 
@@ -53,7 +65,7 @@ estimated cost: $0.0012
 
 | Module | Lines | What it owns |
 |---|---|---|
-| `__main__.py` | ~190 | flags, the REPL, `/compact /tokens /session /rules /exit`, wiring |
+| `__main__.py` | ~200 | flags, the REPL, the one-shot `mh` entry point, `/compact /tokens /session /rules /exit`, wiring |
 | `loop.py` | ~260 | the two loops, invariants, parallel dispatch, subagent spawning |
 | `model.py` | ~200 | one POST or one SSE stream, retries, usage |
 | `session.py` | ~110 | the append-only JSONL log, and the replay that reads it |
@@ -185,12 +197,13 @@ including malformed tool calls, retryable errors and split SSE chunks.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-114 tests cover: verbatim append and tool-call pairing, tool errors as results,
+115 tests cover: verbatim append and tool-call pairing, tool errors as results,
 the step cap, rule precedence, ask-to-deny without a human, always-allow
 persistence, workspace and symlink escapes, edit uniqueness, fold boundaries that
 never split a pair, compaction replay, resume, budget stops, parallel result
-ordering, subagent isolation and depth refusal, and MCP discovery through the
-policy. `tests/fake_mcp_server.py` is a real MCP server over stdio.
+ordering, subagent isolation and depth refusal, MCP discovery through the
+policy, and the one-shot `mh` invocation. `tests/fake_mcp_server.py` is a real
+MCP server over stdio.
 
 ## Live smoke checklist
 

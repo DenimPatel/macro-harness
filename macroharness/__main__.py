@@ -38,6 +38,8 @@ def build_parser():
                         help="use the blocking endpoint instead of SSE")
     parser.add_argument("--non-interactive", action="store_true",
                         help="resolve every 'ask' rule to deny instead of prompting")
+    parser.add_argument("prompt", nargs="*",
+                        help="one-shot prompt; when omitted, start the REPL")
     return parser
 
 
@@ -178,7 +180,16 @@ def main(argv=None):
         harness = build(args)
     except PolicyError as error:
         sys.exit(str(error))
-    repl(harness)
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        repl(harness)
+        return 0
+    try:
+        harness.run_user_turn(prompt)
+    except KeyboardInterrupt:
+        harness.out("\n[turn interrupted; the session is kept]")
+    finally:
+        harness.close()
     return 0
 
 
