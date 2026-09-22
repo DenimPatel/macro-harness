@@ -15,7 +15,8 @@ import os
 import time
 
 from . import context
-from .permissions import Permissions
+from . import hooks as hooks_mod
+from .permissions import Permissions, primary_arg
 from .session import Session
 from .tools import decode_args, truncate
 
@@ -45,7 +46,7 @@ class Harness:
     def __init__(self, model, registry, permissions, session, accounting, root,
                  system_prompt=MAIN_SYSTEM_PROMPT, max_steps=16, budget=None,
                  interactive=True, sessions_dir=None, out=print, on_text=None,
-                 depth=0):
+                 depth=0, hooks=None):
         self.model = model
         self.registry = registry
         self.permissions = permissions
@@ -60,6 +61,9 @@ class Harness:
         self.out = out
         self.on_text = on_text
         self.depth = depth
+        # A harness with no hooks file still has a Hooks object, so no call site
+        # has to branch on whether hooks exist.
+        self.hooks = hooks or hooks_mod.Hooks(containment=None)
         self.mcp_servers = []
         self.sub_count = 0
         self.last_reply = ""
@@ -78,6 +82,9 @@ class Harness:
     def run_user_turn(self, user_text):
         """micro's outer loop body, plus budget, accounting and compaction."""
         start_tokens = self.accounting.total
+        # Re-read hooks.json here: a hook added mid-session takes effect on the
+        # next turn, and a hook edited on disk re-crosses trust before it runs.
+        self.hooks.reload()
         self.messages.append({"role": "user", "content": user_text})
         self.session.append({"t": "user", "text": user_text})
         reply = None
@@ -124,6 +131,8 @@ class Harness:
         self.last_reply = reply
         self.last_steps = step
         self.last_turn_tokens = self.accounting.total - start_tokens
+        self.hooks.fire(hooks_mod.TURN_END, reply=reply, steps=step,
+                        tokens=self.last_turn_tokens)
         return reply
 
     def _budget_reached(self):
@@ -141,14 +150,28 @@ class Harness:
             arguments, error = decode_args(function.get("arguments"))
             plans.append({"call": call, "name": name, "arguments": arguments,
                           "error": error, "tool": self.registry.get(name),
-                          "decision": None, "result": None, "ms": None})
+                          "arg": "" if error else primary_arg(name, arguments),
+                          "decision": None, "blocked": None,
+                          "result": None, "ms": None})
         for plan in plans:
             if plan["error"] or plan["tool"] is None:
                 continue
             plan["decision"] = self.permissions.authorize(plan["name"], plan["arguments"])
 
+        # pre_tool hooks run serially and in call order, for the same reason
+        # authorization does: they have side effects, and a blocking hook is a
+        # decision about this call that the next call may depend on. They run
+        # after the policy, so a hook can only ever narrow what was allowed.
+        for plan in plans:
+            if plan["error"] or plan["tool"] is None or not plan["decision"].allowed:
+                continue
+            outcome = self.hooks.before_tool(plan["name"], plan["arg"], plan["arguments"])
+            if outcome.blocked:
+                plan["blocked"] = outcome.note
+
         runnable = [plan for plan in plans if not plan["error"]
-                    and plan["tool"] is not None and plan["decision"].allowed]
+                    and plan["tool"] is not None and plan["decision"].allowed
+                    and plan["blocked"] is None]
         parallel = [plan for plan in runnable if plan["tool"].read_only]
         if len(parallel) > 1:
             with concurrent.futures.ThreadPoolExecutor(
@@ -159,6 +182,22 @@ class Harness:
         for plan in plans:
             if plan["result"] is None:
                 plan["result"] = self._invoke(plan)
+
+        # post_tool hooks, also serial and in call order, before the result is
+        # appended: a captured hook (a formatter, a linter) becomes part of the
+        # tool result the model reads, so it must land before invariant 2 does.
+        for plan in plans:
+            if plan["blocked"] is not None or plan["error"] or plan["tool"] is None:
+                continue
+            if not plan["decision"].allowed:
+                continue
+            outcome = self.hooks.after_tool(
+                plan["name"], plan["arg"], plan["arguments"], plan["result"])
+            if outcome.captured:
+                plan["result"] = "%s\n%s" % (plan["result"], outcome.captured)
+            if str(plan["result"]).startswith("error:"):
+                self.hooks.fire(hooks_mod.TOOL_ERROR, tool=plan["name"],
+                                arg=plan["arg"], result=plan["result"])
 
         # Invariant 2: exactly one result per call, appended in call order.
         for plan in plans:
@@ -181,6 +220,8 @@ class Harness:
             return "error: unknown tool %r" % plan["name"]
         if not plan["decision"].allowed:
             return "user denied this call (%s)" % plan["decision"].note
+        if plan["blocked"] is not None:
+            return plan["blocked"]
         started = time.monotonic()
         try:
             result = plan["tool"].func(**plan["arguments"])
@@ -199,6 +240,8 @@ class Harness:
             return "unknown tool"
         if not plan["decision"].allowed:
             return "denied (%s)" % plan["decision"].note
+        if plan["blocked"] is not None:
+            return "blocked by hook"
         duration = "" if plan["ms"] is None else " in %dms" % plan["ms"]
         return "ok%s" % duration
 
@@ -246,6 +289,7 @@ class Harness:
             out=lambda _line: None,
             on_text=None,
             depth=self.depth + 1,
+            hooks=self.hooks,  # a subagent's tool calls cross the same hooks
         )
         self.out("[subagent] %s" % prompt.strip().splitlines()[0][:100])
         reply = sub.run_user_turn(prompt)
@@ -257,6 +301,7 @@ class Harness:
     # --- meta ---------------------------------------------------------------
 
     def close(self):
+        self.hooks.fire(hooks_mod.SESSION_END, session=self.session.id)
         for server in self.mcp_servers:
             try:
                 server.close()

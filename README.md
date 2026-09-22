@@ -74,6 +74,8 @@ estimated cost: $0.0012
 | `permissions.py` | ~265 | policy file, rule matching, the three-way prompt, rule derivation |
 | `subagents.py` | ~35 | the `task` tool |
 | `mcp.py` | ~170 | stdio JSON-RPC client, `tools/list` and `tools/call` |
+| `hooks.py` | ~290 | lifecycle hooks: `pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end` |
+| `extensions.py` | ~215 | tools defined as data, loaded at startup or added mid-turn |
 
 micro's split was one file because the loop is the whole idea. macro's split is
 one file per layer because the boundaries between layers are the whole idea.
@@ -116,6 +118,7 @@ exists. Skipping is the correct failure mode.
 | Token accounting | provider `usage` when present, `chars / 4` when not, running totals, an estimated cost, and `--budget N` which stops the turn | `context.py` |
 | Prompt caching | **not implemented.** See below | — |
 | Structured file editing | `edit_file` with a uniqueness check, plus `offset`/`limit` on `read_file` | `tools.py` |
+| A harness you can extend while it runs | new tools and lifecycle hooks, declared as data, added at startup **or** during a turn | `extensions.py`, `hooks.py` |
 
 ## The policy file
 
@@ -163,13 +166,119 @@ permissive one. macro therefore trusts on first use: rules are listed once and
 the hash is remembered in `.macroharness/trusted.json`. Silent trust is the thing
 to avoid, not trust itself.
 
+## Extending a harness that is already running
+
+The twelve layers above were all written before your session started. These two
+are the seam that lets a session add to them, and the design rule is that there
+is **no separate path for a built-in and an added capability**: both end at
+`registry.register(Tool(...))`, so by the time `loop.py` dispatches a call it
+cannot tell which is which. Two registration paths would make the second one
+second class, and the second one is the whole point.
+
+### Tools, as data
+
+An extension tool is a shell command template with a JSON Schema on the front:
+
+```json
+.macroharness/tools/run_tests.json
+{
+  "name": "run_tests",
+  "description": "Run the project test suite.",
+  "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+  "command": "python3 -m unittest discover -s {path}",
+  "read_only": true
+}
+```
+
+A template, not Python: Python would run inside the harness process, outside
+`Containment`, and could edit the registry that is supposed to constrain it. A
+command goes through the same `tools.run_command` as `run_bash`, so it inherits
+the workspace jail, the timeout and the scrubbed environment — and it still
+crosses the permission policy on every call, because nothing downstream knows
+it was added late.
+
+`{placeholder}` substitution is a regex plus `shlex.quote`, not `str.format`:
+`str.format` resolves attributes, so `{path.__class__}` on a model-supplied
+mapping is a sentence in a language we did not mean to accept. Every
+placeholder must be a declared parameter, and no extension may shadow an
+existing tool — if a definition could redefine `read_file`, every containment
+guarantee stated in terms of `read_file` would be a guess.
+
+The `define_tool` tool writes one of these and registers it **immediately**, so
+a tool invented on step 1 is callable on step 2 of the same turn. `loop.py` asks
+the registry for schemas on every step rather than caching them at startup,
+which is the one-line reason this works at all.
+
+### Hooks
+
+A tool is something the *model* decides to call. A hook is something the
+*harness* runs whether the model likes it or not, at a point the model cannot
+see. That is where the non-negotiable rules go.
+
+```json
+.macroharness/hooks.json
+{
+  "version": 1,
+  "hooks": [
+    {"event": "pre_tool",  "tool": "write_file", "arg": "*",
+     "run": "git check-ignore -q {arg} && exit 1 || exit 0", "blocking": true},
+    {"event": "post_tool", "tool": "write_file", "arg": "*.py",
+     "run": "python3 -m py_compile {arg}", "capture": true},
+    {"event": "turn_end",  "run": "afplay /System/Library/Sounds/Glass.aiff"}
+  ]
+}
+```
+
+Five events — `pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end`
+— matched with the same globs and the same `rule_matches` the policy uses, so
+there is one matching language in the harness rather than two.
+
+Two of the five can change what the model sees, which is what makes hooks more
+than notifications:
+
+- a `pre_tool` hook with `"blocking": true` that exits non-zero **cancels the
+  call**, and its output becomes the tool result. The model reads the refusal
+  and adapts, exactly as it would any other tool failure.
+- a `post_tool` hook with `"capture": true` **appends its stdout to the tool
+  result**. A formatter or linter that runs after every write feeds its own
+  errors back into the conversation without the model having thought to ask.
+
+Hooks run *after* the policy, so a hook can only ever narrow what was already
+allowed. They run serially and in call order, for the same reason authorization
+does: they have side effects, and a blocking hook is a decision the next call
+may depend on. Both loop invariants survive — a blocked call still gets exactly
+one `role: "tool"` result, in call order.
+
+Context reaches a hook as `MH_EVENT`, `MH_TOOL`, `MH_ARG` and friends, and as
+the whole call as JSON on stdin. `hooks.json` is re-read at the start of every
+turn, so a hook added mid-session takes effect on the next turn with no restart.
+
+`define_hook` is the runtime half, the same way `define_tool` is for tools.
+
+### Trust
+
+Both files live in the workspace, so a cloned repository could ship a tool
+definition or a hook that this harness would then execute. That is the exact
+problem `policy.json` already had, so it gets the same answer: `trusted.json`
+now holds one digest per file, each accepted once, printed in full before it is
+accepted. **Editing a hook file revokes its trust**, which is the point rather
+than an annoyance — the digest that was accepted is the only version that may
+run. A hook or tool the agent wrote through `define_hook` / `define_tool`
+crossed the permission prompt on the way in, and is marked trusted there, so it
+does not ask twice.
+
+`--no-evolve` leaves `define_tool` and `define_hook` unregistered, for a session
+that should not be able to extend itself.
+
 ## State on disk
 
 ```
 .macroharness/
   policy.json        committed; the rule list
+  hooks.json         committed; the lifecycle hooks
   mcp.json           committed; stdio servers. {"servers": {}}
-  trusted.json       the policy hash this user accepted
+  tools/*.json       committed; one extension tool each
+  trusted.json       the hashes this user accepted, one key per file
   sessions/*.jsonl   append-only; gitignored. Subagents write <id>.sub-N.jsonl
   .gitignore         "sessions/"
 ```
@@ -186,6 +295,8 @@ compacted session resumes compacted.
 | `/tokens` | calls, prompt and completion totals, last request size, estimated cost, how close compaction is |
 | `/session` | session id, log path, message count, subagent count |
 | `/rules` | the live rule list, in evaluation order |
+| `/tools` | every registered tool, built-in, MCP and extension alike |
+| `/hooks` | the live hook list, re-read from disk |
 | `/exit` | leave. Ctrl-C during a turn keeps the session |
 
 ## Tests
@@ -197,7 +308,7 @@ including malformed tool calls, retryable errors and split SSE chunks.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-115 tests cover: verbatim append and tool-call pairing, tool errors as results,
+169 tests cover: verbatim append and tool-call pairing, tool errors as results,
 the step cap, rule precedence, ask-to-deny without a human, always-allow
 persistence, workspace and symlink escapes, edit uniqueness, fold boundaries that
 never split a pair, compaction replay, resume, budget stops, parallel result
@@ -213,6 +324,9 @@ Run these by hand in a scratch directory when you change the loop:
 2. Ctrl-C mid-turn, then `python3 -m macroharness --resume` — the transcript returns.
 3. `/compact` on a long session, then `/tokens` — the fold is logged and accounted.
 4. Add a server to `.macroharness/mcp.json`, restart, and call one of its tools.
+5. Ask it for a capability it does not have ("add a tool that counts lines in a
+   file") and then use that tool in the same turn.
+6. Ask it to notify you when a turn ends, then run another turn.
 
 ## What is still missing
 
@@ -225,9 +339,15 @@ Run these by hand in a scratch directory when you change the loop:
 - **A real sandbox.** `run_bash` is contained, not isolated: it runs as you, on
   your machine. This is exactly why it defaults to `ask`. Real isolation needs
   containers or a syscall filter, which is a different project.
-- **Everything deepseek-harness already does.** No plugin system, no DI, no web
-  UI, no multi-provider abstraction, no durable background jobs, no resources or
+- **Everything deepseek-harness already does.** No DI, no web UI, no
+  multi-provider abstraction, no durable background jobs, no resources or
   notifications beyond MCP tools, no Windows process-group semantics.
+- **The rest of the evolution surface.** Tools and hooks are two rungs of a
+  taller ladder: durable facts, mined proposals, saved procedures, and the
+  control-flow decisions still hardcoded in `model.py` and `loop.py` (retry
+  classification, model routing, verify-before-write). `docs/evolving-harness.md`
+  works through what each rung costs and what the prior art says about doing it
+  without the harness quietly rotting.
 
 ## The three rungs
 

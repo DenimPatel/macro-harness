@@ -391,6 +391,12 @@ In the repo's idiom: one module per layer, stdlib only, small enough to read in
 a sitting. Ordered by value-per-risk, and each stage is independently useful —
 this is not a plan that only pays off at the end.
 
+Stages 3 and 4 are built; see the README's *Extending a harness that is already
+running*. They were taken first, out of order, because between them they cover
+"add a capability" and "run something every time" — which is most of what people
+actually ask a harness for — and because both are rung 3, where a mutation is
+still data and a mistake is still a deleted file.
+
 ### Stage 1 — `memory.py` (~90 lines). Rung 0, source A.
 
 An append-only `.macroharness/memory.jsonl` of itemized facts, each with
@@ -420,32 +426,50 @@ Generative Agents' reflection step and MAPE-K's Analyze, over a log we already
 keep. Note that `always allow` is the N=1 online version of exactly this, so
 Stage 2 is a generalization of shipped code, not a new idea.
 
-### Stage 3 — `hooks.py` (~70 lines). Rung 3, source A.
+### Stage 3 — `hooks.py` (~290 lines). Rung 3, source A. **Built.**
 
-`.macroharness/hooks.json`: lifecycle event → shell command.
-Events: `turn_end`, `session_end`, `tool_error`, `budget_exceeded`,
-`before_tool`. Commands run through the same containment and the same
-permission pipeline as `run_bash` — no new privilege path.
+`.macroharness/hooks.json`: lifecycle event → shell command. Events:
+`pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end`, matched with
+the same globs and the same `permissions.rule_matches` the policy uses.
+Commands run through the same `tools.run_command` as `run_bash` — no new
+privilege path, and hooks run *after* the policy, so a hook can only narrow what
+was already allowed.
 
-This is where "play a sound when the agent finishes" lands, and it lands as a
-**config edit the agent can make on request**, not a code change. Cheapest
-possible answer to a large class of "I wish it would also…" asks, and it is the
-Claude Code hooks lesson applied directly.
+Two of the events are load-bearing rather than decorative. A `pre_tool` hook
+marked `blocking` that exits non-zero cancels the call and its output becomes
+the tool result; a `post_tool` hook marked `capture` appends its stdout to the
+tool result. The second one is the interesting one: a linter that runs after
+every write feeds its own errors back into the conversation without the model
+having thought to ask. That is the harness teaching the model something within
+a single turn.
 
-### Stage 4 — `skills.py` (~130 lines). Rungs 2–3, sources A and B.
+"Play a sound when the agent finishes" lands here, as a **config edit the agent
+can make on request** rather than a code change. Cheapest possible answer to a
+large class of "I wish it would also…" asks, and it is the Claude Code hooks
+lesson applied directly. `define_hook` is the runtime half.
 
-Voyager's skill library, filesystem edition. `.macroharness/skills/<name>/` with
-a `skill.md` (when to use it, the procedure) and optionally `tool.py` exporting
-a registry-compatible function. Discovered at startup, registered in the
-*existing* `Registry` so generated tools cross the same permission pipeline as
-built-ins and MCP tools. Retrieval by name and description match — no embedding
-store; a few dozen skills is a linear scan, and the moment it isn't, that's a
-real signal worth measuring rather than pre-optimizing.
+### Stage 4 — `extensions.py` (~215 lines). Rung 3, sources A and B. **Built.**
 
-A `learn_skill` tool lets the agent write one after doing a task well. Skills
-compose by calling each other through `task`. This is the rung where the
-harness starts getting *expert* rather than merely *configured*, and it does so
-without touching a single line of `loop.py`.
+Voyager's skill library, filesystem edition, at its simplest useful size.
+`.macroharness/tools/<name>.json` holds a JSON Schema and a shell command
+template; `define_tool` writes one and registers it mid-turn. Discovered at
+startup and registered in the *existing* `Registry`, so an extension tool
+crosses the same permission pipeline as a built-in or an MCP tool — `loop.py`
+cannot tell them apart, which was the design goal.
+
+The deliberate restriction is that a definition is a **command template, not
+Python**. Python would run inside the harness process, outside `Containment`,
+and could edit the registry that is supposed to constrain it. A command
+inherits the jail. Substitution is a regex plus `shlex.quote` rather than
+`str.format`, because `str.format` resolves attributes and a model-supplied
+mapping should not get to say `{x.__class__}`. And no extension may shadow an
+existing tool: if a definition could redefine `read_file`, every containment
+guarantee stated in terms of `read_file` would become a guess.
+
+Still open at this rung: procedures (rung 2) — a `skill.md` describing *when*
+to reach for a sequence, rather than a single command — and retrieval once a
+few dozen accumulate. Linear scan is correct until it isn't, and the moment it
+isn't is a real signal worth measuring rather than pre-optimizing.
 
 ### Stage 5 — `strategy.py` (~110 lines). Rung 4, source C.
 

@@ -115,9 +115,27 @@ def policy_digest(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-def mark_trusted(state_dir, path):
+def trusted_digests(state_dir):
+    """Every workspace file this user has accepted, by key. Unreadable is empty."""
+    try:
+        with open(os.path.join(state_dir, "trusted.json"), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def mark_trusted(state_dir, path, key="policy_sha256"):
+    """Record one file's digest. Merges, because more than one file is trusted.
+
+    Anything in the workspace that the harness will *execute* -- the policy, the
+    hook list, the extension tools -- needs an entry here, or a cloned repository
+    gets to run code you never saw.
+    """
+    trusted = trusted_digests(state_dir)
+    trusted[key] = policy_digest(path)
     with open(os.path.join(state_dir, "trusted.json"), "w", encoding="utf-8") as handle:
-        json.dump({"policy_sha256": policy_digest(path)}, handle)
+        json.dump(trusted, handle, indent=2)
 
 
 def _default_trust_prompt(question):
@@ -136,15 +154,7 @@ def trust_policy(state_dir, path, prompt_fn=None, interactive=True, out=print):
     mitigation: silent trust is the thing to avoid, not trust itself.
     """
     digest = policy_digest(path)
-    trusted_file = os.path.join(state_dir, "trusted.json")
-    trusted = {}
-    if os.path.exists(trusted_file):
-        try:
-            with open(trusted_file, "r", encoding="utf-8") as handle:
-                trusted = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            trusted = {}
-    if trusted.get("policy_sha256") == digest:
+    if trusted_digests(state_dir).get("policy_sha256") == digest:
         return
     rules = load_policy(path)["rules"]
     out("policy: %s defines %d rule(s):" % (path, len(rules)))

@@ -149,16 +149,31 @@ def _edit_file(containment, path, old_string, new_string, replace_all=False):
     return "replaced %d occurrence(s) in %s" % (occurrences if replace_all else 1, path)
 
 
-def _run_bash(containment, command):
+TIMED_OUT = -1
+
+
+def run_command(containment, command, extra_env=None, stdin_text=None, timeout=None):
+    """Run one contained shell command. Returns (returncode, stdout, stderr).
+
+    The single place a subprocess is started, so `run_bash`, hooks and
+    extension tools all inherit the same jail: the workspace as cwd, a scrubbed
+    environment, a timeout, and a killed process group on the way out.
+    `extra_env` is layered on top of the scrubbed environment, never under it,
+    so a caller can pass context in without widening what the child inherits.
+    """
+    limit = containment.timeout if timeout is None else timeout
+    env = containment.env()
+    env.update(extra_env or {})
     kwargs = {}
     if os.name != "nt":
         kwargs["start_new_session"] = True
     process = subprocess.Popen(
-        command, shell=True, cwd=containment.root, env=containment.env(),
+        command, shell=True, cwd=containment.root, env=env,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs
     )
     try:
-        stdout, stderr = process.communicate(timeout=containment.timeout)
+        stdout, stderr = process.communicate(input=stdin_text, timeout=limit)
     except subprocess.TimeoutExpired:
         if os.name != "nt":
             try:
@@ -168,8 +183,15 @@ def _run_bash(containment, command):
         else:
             process.kill()
         process.communicate()
+        return TIMED_OUT, "", "timed out after %ds" % limit
+    return process.returncode, stdout, stderr
+
+
+def _run_bash(containment, command):
+    code, stdout, stderr = run_command(containment, command)
+    if code == TIMED_OUT:
         return "error: command timed out after %ds" % containment.timeout
-    return "exit %d\nstdout:\n%s\nstderr:\n%s" % (process.returncode, stdout, stderr)
+    return "exit %d\nstdout:\n%s\nstderr:\n%s" % (code, stdout, stderr)
 
 
 def default_registry(containment):

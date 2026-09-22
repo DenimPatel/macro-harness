@@ -5,7 +5,8 @@ import json
 import os
 import sys
 
-from . import context, mcp, permissions, session as session_mod, tools as tools_mod
+from . import (context, extensions, hooks as hooks_mod, mcp, permissions,
+               session as session_mod, tools as tools_mod)
 from .loop import Harness
 from .model import Model
 from .permissions import PolicyError
@@ -16,7 +17,7 @@ DEFAULT_MODEL = "deepseek-chat"
 STATE_DIR = ".macroharness"
 GITIGNORE = "sessions/\n"
 BANNER = ("macro-harness: the loop plus the layers. "
-          "/compact /tokens /session /rules /exit")
+          "/compact /tokens /session /rules /tools /hooks /exit")
 
 
 def build_parser():
@@ -38,6 +39,9 @@ def build_parser():
                         help="use the blocking endpoint instead of SSE")
     parser.add_argument("--non-interactive", action="store_true",
                         help="resolve every 'ask' rule to deny instead of prompting")
+    parser.add_argument("--no-evolve", action="store_true",
+                        help="do not register define_tool and define_hook, so the "
+                             "harness cannot extend itself this session")
     parser.add_argument("prompt", nargs="*",
                         help="one-shot prompt; when omitted, start the REPL")
     return parser
@@ -96,6 +100,7 @@ def build(args, model=None, trust_prompt=None, out=print):
 
     containment = tools_mod.Containment(root, env_allow=policy.get("env_allow") or ())
     registry = tools_mod.default_registry(containment)
+    hooks = hooks_mod.Hooks.load(containment, state, interactive=interactive, out=out)
 
     on_text = None
     if model is None:
@@ -120,10 +125,18 @@ def build(args, model=None, trust_prompt=None, out=print):
         sessions_dir=sessions_dir,
         out=out,
         on_text=on_text,
+        hooks=hooks,
     )
     registry.register(task_tool(harness.spawn_subagent))
     harness.mcp_servers = mcp.load_servers(
         registry, load_mcp_config(os.path.join(state, "mcp.json")), root, out=out)
+
+    # Extensions register last, so they see every name already taken and cannot
+    # shadow a built-in, a subagent tool or an MCP tool.
+    extensions.load_all(registry, containment, state, interactive=interactive, out=out)
+    if not args.no_evolve:
+        registry.register(extensions.define_tool_tool(registry, containment, state))
+        registry.register(hooks_mod.define_hook_tool(hooks))
     return harness
 
 
@@ -147,6 +160,19 @@ def meta(harness, line, out):
         out("policy: %s" % harness.permissions.path)
         for rule in harness.permissions.rules:
             out("  %-5s %-30s %s" % (rule["verb"], rule["tool"], rule["arg"]))
+    elif command == "/tools":
+        for name in harness.registry.names():
+            tool = harness.registry.get(name)
+            out("  %-24s %s%s" % (name, "[read-only] " if tool.read_only else "",
+                                  tool.description.splitlines()[0][:80]))
+    elif command == "/hooks":
+        harness.hooks.reload()
+        if not harness.hooks.hooks:
+            out("no hooks (%s)" % (harness.hooks.path or "no file"))
+        else:
+            out("hooks: %s" % harness.hooks.path)
+            for hook in harness.hooks.hooks:
+                out("  %s" % hooks_mod.describe(hook))
     else:
         out("unknown command %s" % command)
     return False
