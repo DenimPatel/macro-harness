@@ -426,7 +426,7 @@ Generative Agents' reflection step and MAPE-K's Analyze, over a log we already
 keep. Note that `always allow` is the N=1 online version of exactly this, so
 Stage 2 is a generalization of shipped code, not a new idea.
 
-### Stage 3 — `hooks.py` (~290 lines). Rung 3, source A. **Built.**
+### Stage 3 — `hooks.py` (~335 lines). Rung 3, source A. **Built.**
 
 `.macroharness/hooks.json`: lifecycle event → shell command. Events:
 `pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end`, matched with
@@ -448,7 +448,7 @@ can make on request** rather than a code change. Cheapest possible answer to a
 large class of "I wish it would also…" asks, and it is the Claude Code hooks
 lesson applied directly. `define_hook` is the runtime half.
 
-### Stage 4 — `extensions.py` (~215 lines). Rung 3, sources A and B. **Built.**
+### Stage 4 — `extensions.py` (~240 lines). Rung 3, sources A and B. **Built.**
 
 Voyager's skill library, filesystem edition, at its simplest useful size.
 `.macroharness/tools/<name>.json` holds a JSON Schema and a shell command

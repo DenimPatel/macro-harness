@@ -74,8 +74,8 @@ estimated cost: $0.0012
 | `permissions.py` | ~265 | policy file, rule matching, the three-way prompt, rule derivation |
 | `subagents.py` | ~35 | the `task` tool |
 | `mcp.py` | ~170 | stdio JSON-RPC client, `tools/list` and `tools/call` |
-| `hooks.py` | ~290 | lifecycle hooks: `pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end` |
-| `extensions.py` | ~215 | tools defined as data, loaded at startup or added mid-turn |
+| `hooks.py` | ~335 | lifecycle hooks: `pre_tool`, `post_tool`, `tool_error`, `turn_end`, `session_end` |
+| `extensions.py` | ~240 | tools defined as data, loaded at startup or added mid-turn |
 
 micro's split was one file because the loop is the whole idea. macro's split is
 one file per layer because the boundaries between layers are the whole idea.
