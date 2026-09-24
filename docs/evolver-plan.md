@@ -1,6 +1,8 @@
 # Plan: an offline evolver for macro-harness
 
-*Companion to [`evolving-harness-review.md`](./evolving-harness-review.md) §4. Status: approved plan, not yet implemented.*
+*Companion to [`evolving-harness-review.md`](./evolving-harness-review.md) §4. Status: **built**. The README's
+"The evolver" section is the user-facing description. See "As built" at the end for where the build
+departs from this plan.*
 
 ## Context
 
@@ -170,3 +172,31 @@ import the evolver.
 - Strategy: values above the hard caps are clamped, and `base_url` in
   `strategy.json` is ignored with a warning.
 - Optional manual: with `DEEPSEEK_API_KEY` set, `mh-evolve gate --live --budget 50000` on one replay case.
+
+## As built: departures from the plan
+
+Found while building, each for a stated reason:
+
+- **Tests live in `tests/test_evolver/`, not `tests/evolver/`.** `unittest discover -s tests`
+  imports a `tests/evolver` package as `evolver`, which shadows the real package.
+- **Compaction is not mined.** A session that compacts often is a symptom with several opposite
+  cures (compact earlier, keep less, summarize harder). A miner that guesses between them is a miner
+  that guesses. Only `max_steps` and `retry.max` are mined.
+- **Evolved hooks may inform, not block.** `verify` refuses `blocking: true`. Every catalogue hook
+  is a `post_tool` check whose output is shown to the model; a hook that can cancel calls is the
+  user's decision to write, not a miner's.
+- **Held-out sessions are pinned.** With too few sessions for the hash to pick one, the newest is
+  held out; the store records every session ever held out (`held_out.json`), so none drifts back into
+  the mining set as sessions arrive, and replay cases stay out of the proposer's reach.
+- **A new regression kind: `new_failures`.** `run_bash` reports `outcome: ok` for any exit code, so
+  a candidate that makes a held-out command start exiting non-zero would not have been an `error`.
+  The gate compares `exit N` too.
+- **Gate failures are not permanent; human rejections and reverts are.** A proposal the gate failed
+  (for example before any held-out session existed) is re-mined once its evidence has grown. One the
+  user rejected, or applied and then reverted, is never proposed again.
+- **`evolver/pipeline.py`** holds ingest → mine → gate → inbox as plain functions, so the CLI is a
+  thin shell and the tests call the same code.
+- **The header records the full `base_url`** as well as its host, so tier 2 can reach an endpoint
+  with a path (`/v1`).
+- **Artifact-use for extension tools is logged in the serial post-tool loop**, not in `_invoke`,
+  which may run on a pool thread for parallel read-only calls.
