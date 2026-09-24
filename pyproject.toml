@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 mh = "macroharness.__main__:main"
+mh-evolve = "evolver.__main__:main"
 
 [tool.setuptools]
-packages = ["macroharness"]
+packages = ["macroharness", "evolver", "evolver.miners", "evolver.adapters"]
