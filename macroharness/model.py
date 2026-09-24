@@ -16,10 +16,11 @@ import urllib.request
 class ModelError(Exception):
     """A failed model call. `retryable` decides whether the loop tries again."""
 
-    def __init__(self, message, retryable=False, retry_after=None):
+    def __init__(self, message, retryable=False, retry_after=None, status=None):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
+        self.status = status  # the HTTP status, or None for a connection-level failure
 
 
 class Completion:
@@ -30,8 +31,13 @@ class Completion:
         self.usage = usage or {}
 
 
-def with_retries(operation, max_retries=3, sleep=time.sleep, jitter=random.random, out=None):
-    """Run `operation`, retrying only errors that mark themselves retryable."""
+def with_retries(operation, max_retries=3, sleep=time.sleep, jitter=random.random, out=None,
+                 backoff_cap=8, on_retry=None):
+    """Run `operation`, retrying only errors that mark themselves retryable.
+
+    `on_retry(error, attempt)` is told about every retry before the sleep, so the
+    session log can record it; what it returns is ignored.
+    """
     for attempt in range(max_retries + 1):
         try:
             return operation()
@@ -40,9 +46,11 @@ def with_retries(operation, max_retries=3, sleep=time.sleep, jitter=random.rando
                 raise
             delay = error.retry_after
             if delay is None:
-                delay = min(2 ** attempt, 8) + jitter()
+                delay = min(2 ** attempt, backoff_cap) + jitter()
             if out is not None:
                 out("model: %s; retrying in %.1fs" % (error, delay))
+            if on_retry is not None:
+                on_retry(error, attempt + 1)
             sleep(delay)
     raise AssertionError("unreachable")
 
@@ -95,7 +103,8 @@ class Model:
     """An OpenAI-shaped chat-completions client."""
 
     def __init__(self, base_url, model, api_key, timeout=120, max_retries=3,
-                 stream=True, out=None):
+                 stream=True, out=None, backoff_cap=8, retry_statuses=None,
+                 on_retry=None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -103,12 +112,18 @@ class Model:
         self.max_retries = max_retries
         self.stream = stream
         self.out = out
+        self.backoff_cap = backoff_cap
+        # None keeps the default rule: 429 and every 5xx are worth another try.
+        self.retry_statuses = frozenset(retry_statuses) if retry_statuses else None
+        self.on_retry = on_retry
 
     def complete(self, messages, tools, on_text=None):
         return with_retries(
             lambda: self._attempt(messages, tools, on_text),
             max_retries=self.max_retries,
             out=self.out,
+            backoff_cap=self.backoff_cap,
+            on_retry=self.on_retry,
         )
 
     def _attempt(self, messages, tools, on_text):
@@ -146,9 +161,13 @@ class Model:
                 retry_after = float(retry_after) if retry_after else None
             except ValueError:
                 retry_after = None
-            retryable = error.code == 429 or error.code >= 500
+            if self.retry_statuses is not None:
+                retryable = error.code in self.retry_statuses
+            else:
+                retryable = error.code == 429 or error.code >= 500
             raise ModelError("HTTP %s: %s" % (error.code, body.strip()),
-                             retryable=retryable, retry_after=retry_after)
+                             retryable=retryable, retry_after=retry_after,
+                             status=error.code)
         except urllib.error.URLError as error:
             raise ModelError("connection failed: %s" % error.reason, retryable=True)
         except (TimeoutError, socket.timeout):

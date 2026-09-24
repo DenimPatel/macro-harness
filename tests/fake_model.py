@@ -82,7 +82,8 @@ class Collector:
 
 def build_harness(root, replies, rules=None, interactive=True, answers=None,
                   budget=None, max_steps=8, out=None, mcp_config=None,
-                  timeout=10, extra_tools=None, hooks=None):
+                  timeout=10, extra_tools=None, hooks=None, evolved=None,
+                  session=None):
     """A fully wired Harness with the fake model, in a throwaway workspace."""
     state = os.path.join(root, ".macroharness")
     sessions_dir = os.path.join(state, "sessions")
@@ -99,7 +100,7 @@ def build_harness(root, replies, rules=None, interactive=True, answers=None,
     console = permissions.Permissions(policy, policy_path, state_dir=state,
                                       interactive=interactive, prompt_fn=prompt_fn)
     output = out if out is not None else Collector()
-    session = session_mod.Session.create(sessions_dir, "test")
+    session = session or session_mod.Session.create(sessions_dir, "test")
     containment = tools_mod.Containment(root, timeout=timeout)
     registry = tools_mod.default_registry(containment)
     for tool in extra_tools or ():
@@ -115,6 +116,7 @@ def build_harness(root, replies, rules=None, interactive=True, answers=None,
         accounting=context.Accounting(model_name="scripted"), root=root,
         max_steps=max_steps, budget=budget, interactive=interactive,
         sessions_dir=sessions_dir, out=output, on_text=None, hooks=hook_set,
+        evolved=evolved,
     )
     if hooks:
         hooks_mod.write_config(hook_set.path, hook_set.config)

@@ -15,6 +15,7 @@ import os
 import time
 
 from . import context
+from . import contract
 from . import hooks as hooks_mod
 from .permissions import Permissions, primary_arg
 from .session import Session
@@ -46,7 +47,8 @@ class Harness:
     def __init__(self, model, registry, permissions, session, accounting, root,
                  system_prompt=MAIN_SYSTEM_PROMPT, max_steps=16, budget=None,
                  interactive=True, sessions_dir=None, out=print, on_text=None,
-                 depth=0, hooks=None):
+                 depth=0, hooks=None, header=None, evolved=None,
+                 parallel_tools=MAX_PARALLEL_TOOLS, compact_at=None):
         self.model = model
         self.registry = registry
         self.permissions = permissions
@@ -64,6 +66,12 @@ class Harness:
         # A harness with no hooks file still has a Hooks object, so no call site
         # has to branch on whether hooks exist.
         self.hooks = hooks or hooks_mod.Hooks(containment=None)
+        self.parallel_tools = max(1, int(parallel_tools))
+        self.compact_at = compact_at
+        # Artifacts an offline evolver applied, by what they look like at run
+        # time. Only used to log `artifact_use`; nothing here changes a decision.
+        self._evolved_source = evolved or {}
+        self._evolved = _evolved_lookup(self._evolved_source)
         self.mcp_servers = []
         self.sub_count = 0
         self.last_reply = ""
@@ -71,11 +79,18 @@ class Harness:
         self.last_turn_tokens = 0
 
         self.messages = session.messages()
+        resumed = bool(self.messages)
         if not self.messages:
             # The system prompt is logged like everything else, so a resumed
             # session rebuilds byte-identically and fold indexes stay valid.
             self.messages = [{"role": "system", "content": system_prompt}]
             session.append({"t": "system", "text": system_prompt})
+        # Every new or resumed segment of a log says what harness state it ran
+        # under, so the evolver can replay it against the same state later.
+        header_event = {"t": contract.HEADER, "trace_version": contract.TRACE_VERSION,
+                        "resumed": resumed, "depth": depth}
+        header_event.update(header or {})
+        session.append(header_event)
 
     # --- one user turn ------------------------------------------------------
 
@@ -90,6 +105,7 @@ class Harness:
         reply = None
         printed = False
         step = 0
+        stopped = contract.STOPPED_NONE
 
         for step in range(1, self.max_steps + 1):
             if self._budget_reached():
@@ -97,8 +113,10 @@ class Harness:
                                      "limit": self.budget})
                 reply = "[stopped: token budget reached (%d/%d)]" % (
                     self.accounting.total, self.budget)
+                stopped = contract.STOPPED_BUDGET
                 break
-            if context.estimate_tokens(self.messages) > context.COMPACT_AT:
+            compact_at = self.compact_at if self.compact_at is not None else context.COMPACT_AT
+            if context.estimate_tokens(self.messages) > compact_at:
                 self.compact_context()
 
             completion = self.model.complete(
@@ -123,6 +141,7 @@ class Harness:
             self._run_tool_calls(message["tool_calls"])
         else:
             reply = "[stopped: reached %d tool rounds]" % self.max_steps
+            stopped = contract.STOPPED_MAX_STEPS
 
         if reply is None:
             reply = "[stopped: no reply]"
@@ -131,9 +150,21 @@ class Harness:
         self.last_reply = reply
         self.last_steps = step
         self.last_turn_tokens = self.accounting.total - start_tokens
+        self.session.append({"t": contract.TURN_END, "steps": step,
+                             "tokens": self.last_turn_tokens, "stopped": stopped})
         self.hooks.fire(hooks_mod.TURN_END, reply=reply, steps=step,
                         tokens=self.last_turn_tokens)
         return reply
+
+    def record_retry(self, error, attempt):
+        """Given to Model as `on_retry`, so retries land in the trace."""
+        self.session.append({"t": contract.RETRY, "attempt": attempt,
+                             "status": getattr(error, "status", None),
+                             "error": str(error)[:200]})
+
+    def _log_use(self, artifact_id):
+        if artifact_id:
+            self.session.append({"t": contract.ARTIFACT_USE, "id": artifact_id})
 
     def _budget_reached(self):
         return self.budget is not None and self.accounting.total >= self.budget
@@ -157,6 +188,9 @@ class Harness:
             if plan["error"] or plan["tool"] is None:
                 continue
             plan["decision"] = self.permissions.authorize(plan["name"], plan["arguments"])
+            rule = plan["decision"].rule
+            if rule is not None:
+                self._log_use(self._evolved["rules"].get(_key(contract.rule_key(rule))))
 
         # pre_tool hooks run serially and in call order, for the same reason
         # authorization does: they have side effects, and a blocking hook is a
@@ -165,6 +199,7 @@ class Harness:
         for plan in plans:
             if plan["error"] or plan["tool"] is None or not plan["decision"].allowed:
                 continue
+            self._log_hook_uses(hooks_mod.PRE_TOOL, plan)
             outcome = self.hooks.before_tool(plan["name"], plan["arg"], plan["arguments"])
             if outcome.blocked:
                 plan["blocked"] = outcome.note
@@ -175,7 +210,7 @@ class Harness:
         parallel = [plan for plan in runnable if plan["tool"].read_only]
         if len(parallel) > 1:
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(MAX_PARALLEL_TOOLS, len(parallel))) as pool:
+                    max_workers=min(self.parallel_tools, len(parallel))) as pool:
                 futures = {pool.submit(self._invoke, plan): plan for plan in parallel}
                 for future in concurrent.futures.as_completed(futures):
                     futures[future]["result"] = future.result()
@@ -191,6 +226,9 @@ class Harness:
                 continue
             if not plan["decision"].allowed:
                 continue
+            # Logged here, serially, not in _invoke: that may run on a pool thread.
+            self._log_use(self._evolved["tools"].get(plan["name"]))
+            self._log_hook_uses(hooks_mod.POST_TOOL, plan)
             outcome = self.hooks.after_tool(
                 plan["name"], plan["arg"], plan["arguments"], plan["result"])
             if outcome.captured:
@@ -210,6 +248,7 @@ class Harness:
                 "content": content, "ms": plan["ms"],
                 "decision": plan["decision"].verb if plan["decision"] else "error",
                 "note": plan["decision"].note if plan["decision"] else plan["error"],
+                "arg": plan["arg"], "outcome": self._outcome(plan),
             })
             self.out("  %s: %s" % (plan["name"], self._summary(plan)))
 
@@ -231,6 +270,24 @@ class Harness:
             result = "error: %s: %s" % (type(error).__name__, error)
         plan["ms"] = int((time.monotonic() - started) * 1000)
         return result
+
+    def _log_hook_uses(self, event, plan):
+        if not self._evolved["hooks"]:
+            return
+        for hook in self.hooks.matching(event, plan["name"], plan["arg"]):
+            self._log_use(self._evolved["hooks"].get(_key(contract.hook_key(hook))))
+
+    @staticmethod
+    def _outcome(plan):
+        if plan["error"] or plan["tool"] is None:
+            return contract.ERROR
+        if not plan["decision"].allowed:
+            return contract.DENIED
+        if plan["blocked"] is not None:
+            return contract.BLOCKED
+        if str(plan["result"]).startswith("error:"):
+            return contract.ERROR
+        return contract.OK
 
     @staticmethod
     def _summary(plan):
@@ -290,6 +347,9 @@ class Harness:
             on_text=None,
             depth=self.depth + 1,
             hooks=self.hooks,  # a subagent's tool calls cross the same hooks
+            evolved=self._evolved_source,
+            parallel_tools=self.parallel_tools,
+            compact_at=self.compact_at,
         )
         self.out("[subagent] %s" % prompt.strip().splitlines()[0][:100])
         reply = sub.run_user_turn(prompt)
@@ -307,3 +367,23 @@ class Harness:
                 server.close()
             except Exception:
                 pass
+
+
+def _key(parts):
+    return "\x1f".join(str(part) for part in parts)
+
+
+def _evolved_lookup(artifacts):
+    """Index `evolved.json` artifacts by what they look like at run time."""
+    lookup = {"rules": {}, "hooks": {}, "tools": {}}
+    for artifact_id, entry in artifacts.items():
+        if not isinstance(entry, dict):
+            continue
+        kind, match = entry.get("kind"), entry.get("match")
+        if kind == contract.POLICY_RULE and isinstance(match, dict):
+            lookup["rules"][_key(contract.rule_key(match))] = artifact_id
+        elif kind == contract.HOOK and isinstance(match, dict):
+            lookup["hooks"][_key(contract.hook_key(match))] = artifact_id
+        elif kind == contract.TOOL_DEF and isinstance(match, dict) and match.get("name"):
+            lookup["tools"][match["name"]] = artifact_id
+    return lookup

@@ -3,10 +3,13 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
+import urllib.parse
 
-from . import (context, extensions, hooks as hooks_mod, mcp, permissions,
-               session as session_mod, tools as tools_mod)
+from . import (__version__, context, contract, extensions, hooks as hooks_mod, mcp,
+               permissions, session as session_mod, strategy as strategy_mod,
+               tools as tools_mod)
 from .loop import Harness
 from .model import Model
 from .permissions import PolicyError
@@ -29,8 +32,8 @@ def build_parser():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    parser.add_argument("--max-steps", type=int, default=16,
-                        help="tool rounds per user turn (default: 16)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="tool rounds per user turn (default: strategy.json, else 16)")
     parser.add_argument("--budget", type=int, default=None,
                         help="prompt+completion token budget for the session")
     parser.add_argument("--resume", nargs="?", const="latest", default=None,
@@ -50,6 +53,49 @@ def build_parser():
 def state_paths(root):
     state = os.path.join(root, STATE_DIR)
     return state, os.path.join(state, "sessions")
+
+
+def git_head(root):
+    """The commit the workspace was at, so a replay can check the same tree out."""
+    try:
+        result = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def artifact_digests(state):
+    """sha256 of every workspace file that changes what this harness does."""
+    digests = {}
+    for name in ("policy.json", "hooks.json", "strategy.json", "mcp.json"):
+        path = os.path.join(state, name)
+        if os.path.exists(path):
+            digests[name] = permissions.policy_digest(path)
+    directory = extensions.tools_dir(state)
+    if os.path.isdir(directory):
+        for entry in sorted(os.listdir(directory)):
+            if entry.endswith(".json"):
+                digests["tools/" + entry] = permissions.policy_digest(
+                    os.path.join(directory, entry))
+    return digests
+
+
+def trace_header(root, state, model_name, base_url):
+    """What a session log records about the harness it ran under."""
+    artifacts = artifact_digests(state)
+    return {
+        "harness_digest": contract.digest(artifacts),
+        "artifacts": artifacts,
+        "model": model_name,
+        "base_url": base_url,
+        "base_url_host": urllib.parse.urlparse(base_url or "").hostname,
+        "git_head": git_head(root),
+        "version": __version__,
+        "workspace": root,
+    }
 
 
 def load_mcp_config(path):
@@ -98,6 +144,11 @@ def build(args, model=None, trust_prompt=None, out=print):
     else:
         session = session_mod.Session.create(sessions_dir)
 
+    settings = strategy_mod.load(state, interactive=interactive, prompt_fn=trust_prompt,
+                                 out=out)
+    max_steps = args.max_steps if args.max_steps is not None else settings["max_steps"]
+    evolved = contract.read_evolved_index(state)
+
     containment = tools_mod.Containment(root, env_allow=policy.get("env_allow") or ())
     registry = tools_mod.default_registry(containment)
     hooks = hooks_mod.Hooks.load(containment, state, interactive=interactive, out=out)
@@ -110,7 +161,10 @@ def build(args, model=None, trust_prompt=None, out=print):
                               % (args.api_key_env, args.api_key_env))
         on_text = None if args.no_stream else stream_writer()
         model = Model(args.base_url, args.model, api_key,
-                      stream=not args.no_stream, out=out)
+                      stream=not args.no_stream, out=out,
+                      max_retries=settings["retry"]["max"],
+                      backoff_cap=settings["retry"]["backoff_cap"],
+                      retry_statuses=settings["retry"]["on_status"])
 
     harness = Harness(
         model=model,
@@ -119,14 +173,21 @@ def build(args, model=None, trust_prompt=None, out=print):
         session=session,
         accounting=context.Accounting(model_name=args.model),
         root=root,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         budget=args.budget,
         interactive=interactive,
         sessions_dir=sessions_dir,
         out=out,
         on_text=on_text,
         hooks=hooks,
+        header=trace_header(root, state, args.model, args.base_url),
+        evolved=evolved["artifacts"],
+        parallel_tools=settings["parallel_tools"],
+        compact_at=int(context.CONTEXT_LIMIT * settings["compact_at_ratio"]),
     )
+    harness.inbox_pending = evolved["inbox_pending"]
+    if isinstance(model, Model):
+        model.on_retry = harness.record_retry
     registry.register(task_tool(harness.spawn_subagent))
     harness.mcp_servers = mcp.load_servers(
         registry, load_mcp_config(os.path.join(state, "mcp.json")), root, out=out)
@@ -150,7 +211,8 @@ def meta(harness, line, out):
     elif command == "/tokens":
         out(harness.accounting.report())
         out("context now: ~%d tokens (compaction at ~%d)"
-            % (context.estimate_tokens(harness.messages), context.COMPACT_AT))
+            % (context.estimate_tokens(harness.messages),
+               harness.compact_at or context.COMPACT_AT))
     elif command == "/session":
         out("session: %s" % harness.session.id)
         out("file: %s" % harness.session.path)
@@ -180,6 +242,9 @@ def meta(harness, line, out):
 
 def repl(harness, out=print):
     out(BANNER)
+    pending = getattr(harness, "inbox_pending", 0)
+    if pending:
+        out("%d evolver proposal(s) waiting (mh-evolve review)" % pending)
     while True:
         try:
             line = input("\nyou> ")
