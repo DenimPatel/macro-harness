@@ -347,7 +347,9 @@ Run these by hand in a scratch directory when you change the loop:
   control-flow decisions still hardcoded in `model.py` and `loop.py` (retry
   classification, model routing, verify-before-write). `docs/evolving-harness.md`
   works through what each rung costs and what the prior art says about doing it
-  without the harness quietly rotting.
+  without the harness quietly rotting; `docs/self-evolving-harness-log.md`
+  records the design conversation for the two rungs actually built here, and
+  the reasoning on whether control flow itself can be demoted to data.
 
 ## The three rungs
 
