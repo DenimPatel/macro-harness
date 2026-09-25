@@ -11,7 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from macroharness import context, mcp, permissions, session as session_mod, tools as tools_mod
+from macroharness import (context, hooks as hooks_mod, mcp, permissions,
+                          session as session_mod, tools as tools_mod)
 from macroharness.loop import Harness
 from macroharness.model import Completion
 from macroharness.subagents import task_tool
@@ -81,7 +82,8 @@ class Collector:
 
 def build_harness(root, replies, rules=None, interactive=True, answers=None,
                   budget=None, max_steps=8, out=None, mcp_config=None,
-                  timeout=10, extra_tools=None):
+                  timeout=10, extra_tools=None, hooks=None, evolved=None,
+                  session=None):
     """A fully wired Harness with the fake model, in a throwaway workspace."""
     state = os.path.join(root, ".macroharness")
     sessions_dir = os.path.join(state, "sessions")
@@ -98,18 +100,28 @@ def build_harness(root, replies, rules=None, interactive=True, answers=None,
     console = permissions.Permissions(policy, policy_path, state_dir=state,
                                       interactive=interactive, prompt_fn=prompt_fn)
     output = out if out is not None else Collector()
-    session = session_mod.Session.create(sessions_dir, "test")
+    session = session or session_mod.Session.create(sessions_dir, "test")
     containment = tools_mod.Containment(root, timeout=timeout)
     registry = tools_mod.default_registry(containment)
     for tool in extra_tools or ():
         registry.register(tool)
     model = ScriptedModel(replies)
+    # Hooks passed in are already trusted: a test that wants to exercise the
+    # trust prompt writes hooks.json itself and calls Hooks.load.
+    hook_set = hooks_mod.Hooks(
+        containment, config=hooks_mod.validate({"version": 1, "hooks": list(hooks or ())}),
+        path=hooks_mod.hooks_path(state), state_dir=state, out=output)
     harness = Harness(
         model=model, registry=registry, permissions=console, session=session,
         accounting=context.Accounting(model_name="scripted"), root=root,
         max_steps=max_steps, budget=budget, interactive=interactive,
-        sessions_dir=sessions_dir, out=output, on_text=None,
+        sessions_dir=sessions_dir, out=output, on_text=None, hooks=hook_set,
+        evolved=evolved,
     )
+    if hooks:
+        hooks_mod.write_config(hook_set.path, hook_set.config)
+        hook_set.trust_now()
+        hook_set._digest = permissions.policy_digest(hook_set.path)
     registry.register(task_tool(harness.spawn_subagent))
     if mcp_config is not None:
         harness.mcp_servers = mcp.load_servers(registry, mcp_config, root, out=output)
