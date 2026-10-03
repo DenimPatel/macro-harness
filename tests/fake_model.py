@@ -8,6 +8,7 @@ no network, and the transcripts are exact.
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -60,6 +61,39 @@ class ScriptedModel:
         return Completion(message, usage)
 
 
+class RoutingModel:
+    """One script per conversation, chosen by the first user message.
+
+    Parallel subagents call the model from several threads in no fixed order,
+    so a single queue cannot script them. Each conversation is identified by a
+    key that appears in its first user message, and pops from its own queue.
+    """
+
+    def __init__(self, scripts, on_call=None):
+        self.scripts = {key: list(replies) for key, replies in scripts.items()}
+        self.requests = []
+        self.on_call = on_call
+        self._lock = threading.Lock()
+
+    def complete(self, messages, tools, on_text=None):
+        first_user = next((m.get("content") or "" for m in messages
+                           if m.get("role") == "user"), "")
+        key = next((key for key in self.scripts if key in first_user), None)
+        if key is None:
+            raise AssertionError("no script for %r" % first_user[:80])
+        with self._lock:
+            self.requests.append({"key": key, "messages": [dict(m) for m in messages],
+                                  "tools": list(tools or [])})
+            if not self.scripts[key]:
+                raise AssertionError("script %r ran out of replies" % key)
+            raw = self.scripts[key].pop(0)
+        if self.on_call is not None:
+            self.on_call(key, messages)
+        message = dict(raw)
+        usage = message.pop("usage", None) or {}
+        return Completion(message, usage)
+
+
 def load_json(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -81,7 +115,8 @@ class Collector:
 
 def build_harness(root, replies, rules=None, interactive=True, answers=None,
                   budget=None, max_steps=8, out=None, mcp_config=None,
-                  timeout=10, extra_tools=None):
+                  timeout=10, extra_tools=None, agents=None, subagent_max_steps=None,
+                  model=None):
     """A fully wired Harness with the fake model, in a throwaway workspace."""
     state = os.path.join(root, ".macroharness")
     sessions_dir = os.path.join(state, "sessions")
@@ -103,14 +138,15 @@ def build_harness(root, replies, rules=None, interactive=True, answers=None,
     registry = tools_mod.default_registry(containment)
     for tool in extra_tools or ():
         registry.register(tool)
-    model = ScriptedModel(replies)
+    model = model if model is not None else ScriptedModel(replies)
     harness = Harness(
         model=model, registry=registry, permissions=console, session=session,
         accounting=context.Accounting(model_name="scripted"), root=root,
         max_steps=max_steps, budget=budget, interactive=interactive,
         sessions_dir=sessions_dir, out=output, on_text=None,
+        agents=agents, subagent_max_steps=subagent_max_steps,
     )
-    registry.register(task_tool(harness.spawn_subagent))
+    registry.register(task_tool(harness.spawn_subagent, agents))
     if mcp_config is not None:
         harness.mcp_servers = mcp.load_servers(registry, mcp_config, root, out=output)
     return harness, model, output

@@ -6,6 +6,7 @@ and subagents both need to add to the same list and flow through the same
 permission pipeline.
 """
 
+import fnmatch
 import json
 import os
 import signal
@@ -37,12 +38,17 @@ def decode_args(raw):
 
 
 class Tool:
-    def __init__(self, name, description, parameters, func, read_only=False):
+    """`read_only` tools may run in parallel. `concurrent` tools write, but are
+    safe to overlap with each other anyway: `task` is the one that sets it."""
+
+    def __init__(self, name, description, parameters, func, read_only=False,
+                 concurrent=False):
         self.name = name
         self.description = description
         self.parameters = parameters
         self.func = func
         self.read_only = read_only
+        self.concurrent = concurrent
 
     def schema(self):
         return {
@@ -73,6 +79,16 @@ class Registry:
 
     def names(self):
         return list(self._tools)
+
+    def subset(self, patterns=None, exclude=()):
+        """A new registry holding the tools whose names match any glob."""
+        chosen = Registry()
+        for name, tool in self._tools.items():
+            if name in exclude:
+                continue
+            if patterns is None or any(fnmatch.fnmatchcase(name, p) for p in patterns):
+                chosen.register(tool)
+        return chosen
 
 
 class Containment:

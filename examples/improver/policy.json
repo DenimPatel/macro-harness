@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "env_allow": [
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "VIRTUAL_ENV",
+    "NODE_OPTIONS"
+  ],
+  "rules": [
+    {
+      "tool": "read_file",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "write_file",
+      "arg": "*.env",
+      "verb": "deny"
+    },
+    {
+      "tool": "write_file",
+      "arg": "*.pem",
+      "verb": "deny"
+    },
+    {
+      "tool": "write_file",
+      "arg": ".git/*",
+      "verb": "deny"
+    },
+    {
+      "tool": "edit_file",
+      "arg": ".git/*",
+      "verb": "deny"
+    },
+    {
+      "tool": "write_file",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "edit_file",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git push*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git remote add*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git remote set-url*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git rebase*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git reset --hard*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*--amend*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*--force*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git push -f*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git clean*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git stash*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git add -A*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git add --all*",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*git add . *",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "git add .",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*sudo *",
+      "verb": "deny"
+    },
+    {
+      "tool": "run_bash",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "playwright__browser_run_code_unsafe",
+      "arg": "*",
+      "verb": "deny"
+    },
+    {
+      "tool": "playwright__*",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "task",
+      "arg": "*",
+      "verb": "allow"
+    },
+    {
+      "tool": "*",
+      "arg": "*",
+      "verb": "deny"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--headless",
+        "--isolated",
+        "--output-dir",
+        ".improve/artifacts/playwright"
+      ],
+      "timeout": 120
+    }
+  }
+}

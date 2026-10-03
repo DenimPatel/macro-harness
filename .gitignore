@@ -16,3 +16,7 @@ venv/
 # (README "State on disk"); sessions and the trust hash are per-user.
 .macroharness/sessions/
 .macroharness/trusted.json
+.macroharness/mcp-media/
+
+# Playwright MCP writes snapshots and console logs here by default
+.playwright-mcp/

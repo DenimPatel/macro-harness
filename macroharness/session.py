@@ -7,6 +7,7 @@ does not restore a snapshot, it re-runs the same fold the live session ran.
 
 import json
 import os
+import threading
 import time
 
 
@@ -22,10 +23,15 @@ def slugify(text, limit=32):
 
 
 class Session:
-    """One append-only JSONL file. Writing is the only mutation."""
+    """One append-only JSONL file. Writing is the only mutation.
+
+    Parallel subagents append lifecycle events to the parent's log from
+    several threads, so each line is written under a lock.
+    """
 
     def __init__(self, path):
         self.path = path
+        self._lock = threading.Lock()
         self.id = os.path.splitext(os.path.basename(path))[0]
 
     @classmethod
@@ -57,8 +63,9 @@ class Session:
 
     def append(self, event):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        with self._lock, open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(line)
 
     def events(self):
         events = []

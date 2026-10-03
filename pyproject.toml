@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 mh = "macroharness.__main__:main"
+mh-watch = "macroharness.watch:main"
 
 [tool.setuptools]
 packages = ["macroharness"]

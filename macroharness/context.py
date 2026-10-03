@@ -11,6 +11,7 @@ boundary exists.
 """
 
 import json
+import threading
 
 CHARS_PER_TOKEN = 4
 CONTEXT_LIMIT = 64_000
@@ -40,10 +41,14 @@ def estimate_tokens(messages):
 
 
 class Accounting:
-    """Running totals for one session. Subagents share the parent's object."""
+    """Running totals for one session. Subagents share the parent's object.
+
+    Parallel subagents call add() from several threads, hence the lock.
+    """
 
     def __init__(self, model_name=None):
         self.model_name = model_name
+        self._lock = threading.Lock()
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.last_prompt = 0
@@ -54,6 +59,10 @@ class Accounting:
         return self.prompt_tokens + self.completion_tokens
 
     def add(self, usage, request_messages, reply=None):
+        with self._lock:
+            self._add(usage, request_messages, reply)
+
+    def _add(self, usage, request_messages, reply):
         self.calls += 1
         if usage and usage.get("prompt_tokens") is not None:
             self.prompt_tokens += usage.get("prompt_tokens") or 0

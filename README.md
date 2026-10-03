@@ -65,15 +65,16 @@ estimated cost: $0.0012
 
 | Module | Lines | What it owns |
 |---|---|---|
-| `__main__.py` | ~200 | flags, the REPL, the one-shot `mh` entry point, `/compact /tokens /session /rules /exit`, wiring |
-| `loop.py` | ~260 | the two loops, invariants, parallel dispatch, subagent spawning |
+| `__main__.py` | ~275 | flags, the REPL, the one-shot `mh` entry point, `--rounds`, `/compact /tokens /session /rules /mcp /agents /exit`, wiring |
+| `loop.py` | ~330 | the two loops, invariants, parallel dispatch, subagent spawning |
 | `model.py` | ~200 | one POST or one SSE stream, retries, usage |
-| `session.py` | ~110 | the append-only JSONL log, and the replay that reads it |
-| `context.py` | ~155 | token accounting, cost, `fold_boundary`, compaction |
-| `tools.py` | ~215 | the registry, read/write/edit/bash, truncation, containment |
+| `session.py` | ~120 | the append-only JSONL log, and the replay that reads it |
+| `context.py` | ~165 | token accounting, cost, `fold_boundary`, compaction |
+| `tools.py` | ~230 | the registry, read/write/edit/bash, truncation, containment |
 | `permissions.py` | ~265 | policy file, rule matching, the three-way prompt, rule derivation |
-| `subagents.py` | ~35 | the `task` tool |
-| `mcp.py` | ~170 | stdio JSON-RPC client, `tools/list` and `tools/call` |
+| `subagents.py` | ~135 | the `task` tool, agent profiles |
+| `mcp.py` | ~265 | stdio JSON-RPC client, `tools/list` and `tools/call`, media blocks to files |
+| `watch.py` | ~290 | `mh-watch`: the subagent table and live transcripts, read from the logs |
 
 micro's split was one file because the loop is the whole idea. macro's split is
 one file per layer because the boundaries between layers are the whole idea.
@@ -110,8 +111,8 @@ exists. Skipping is the correct failure mode.
 | A permissions policy | `policy.json`: an ordered rule list, first match wins, three verbs. Unknown tools fall through to whatever the file says, and no match is a deny | `permissions.py` |
 | Sandboxing | the workspace is a jail: `realpath` resolution refuses `..` and symlink escapes, `run_bash` gets a scrubbed env, a timeout, and a killed process group. Containment, not isolation | `tools.py` |
 | Session persistence | an append-only JSONL log. The message list is derived by replaying it, which is why resume and compaction agree | `session.py` |
-| Subagents | a `task` tool that runs a nested loop with a fresh context, depth 1, sharing the parent's token budget. Ask degrades to deny inside it | `subagents.py` |
-| MCP | stdio JSON-RPC: `initialize`, `tools/list`, `tools/call`. Server tools are namespaced `server__tool` and registered in the same registry as the built-ins, so they cross the same permission pipeline | `mcp.py` |
+| Subagents | a `task` tool that runs a nested loop with a fresh context, depth 1, sharing the parent's token budget. Ask degrades to deny inside it. Named roles live in `.macroharness/agents/*.md`; several `task` calls in one reply run in parallel; a subagent never gets `task` itself | `subagents.py` |
+| MCP | stdio JSON-RPC: `initialize`, `tools/list`, `tools/call`. Server tools are namespaced `server__tool` and registered in the same registry as the built-ins, so they cross the same permission pipeline. Image blocks become files, stderr is drained, server requests are answered, `timeout` is per server | `mcp.py` |
 | Parallel tool execution | calls that are allowed and read-only run in a small thread pool; everything else stays sequential. Results are appended in call order regardless of completion order | `loop.py` |
 | Token accounting | provider `usage` when present, `chars / 4` when not, running totals, an estimated cost, and `--budget N` which stops the turn | `context.py` |
 | Prompt caching | **not implemented.** See below | — |
@@ -169,14 +170,68 @@ to avoid, not trust itself.
 .macroharness/
   policy.json        committed; the rule list
   mcp.json           committed; stdio servers. {"servers": {}}
+  agents/*.md        committed, optional; named subagent roles
   trusted.json       the policy hash this user accepted
   sessions/*.jsonl   append-only; gitignored. Subagents write <id>.sub-N.jsonl
-  .gitignore         "sessions/"
+  mcp-media/         gitignored; images MCP tools returned, one file each
+  .gitignore         "sessions/", "mcp-media/"
 ```
 
 Session events are typed: `system`, `user`, `assistant`, `tool`, `compact`,
-`budget`, `rule`. Resume does not restore a snapshot; it replays the log, so a
-compacted session resumes compacted.
+`budget`, `rule`, `subagent`. Resume does not restore a snapshot; it replays
+the log, so a compacted session resumes compacted. `subagent` events (running,
+done, error) are skipped by replay; they exist for `mh-watch`.
+
+## Subagents, roles and orchestration
+
+`task` hands a self-contained prompt to a fresh loop. Three additions make it
+usable by an orchestrator that delegates almost everything:
+
+- **Roles.** `.macroharness/agents/verifier.md` is a role, with a header and
+  then the system prompt:
+
+  ```markdown
+  ---
+  description: independent, skeptical verifier
+  tools: read_file, run_bash, write_file, playwright__*
+  max_steps: 60
+  ---
+  You are an independent, skeptical reviewer. You did not write this change...
+  ```
+
+  `task(prompt, agent="verifier")` runs it. `tools` globs narrow the parent's
+  registry; a role cannot widen the policy and cannot get `task`. Without a
+  role, a subagent gets every tool but `task`, and
+  `--subagent-max-steps` (default `min(--max-steps, 8)`) as its step limit.
+- **Parallelism.** `task` is marked `concurrent`: several calls in one reply
+  run in the thread pool, each with its own log, and results land in call
+  order like any parallel round. Accounting and log writes are locked.
+- **One level.** Recursion is refused twice: the subagent's registry has no
+  `task`, and a depth-1 harness refuses to spawn anyway.
+
+Long unattended runs add `--prompt-file`, `--rounds N` (re-enter the session
+with "continue" when a turn ends), `--stop-file PATH` (checked before each
+round) and `--bash-timeout`.
+
+### Watching from another terminal
+
+```sh
+mh-watch              # live table of the latest session's subagents
+mh-watch 3            # follow subagent 3: calls, results, replies, as they happen
+mh-watch main         # follow the parent
+mh-watch --once       # print and exit
+```
+
+The viewer only reads the logs, so it attaches and detaches freely and the
+agent never knows it is there. A subagent whose last logged step has tool calls
+without results is shown as `running <tool> <argument>`.
+
+### The improver workflow
+
+[`examples/improver/`](examples/improver/README.md) packages a complete
+orchestrate–implement–verify–commit loop on top of these pieces: six roles,
+Playwright MCP for browser verification, an unattended policy, an installer,
+and a demo that runs one full pass against a real browser with no API key.
 
 ## Meta commands
 
@@ -186,6 +241,8 @@ compacted session resumes compacted.
 | `/tokens` | calls, prompt and completion totals, last request size, estimated cost, how close compaction is |
 | `/session` | session id, log path, message count, subagent count |
 | `/rules` | the live rule list, in evaluation order |
+| `/mcp` | each MCP server, its timeout, and its tools |
+| `/agents` | the subagent roles, their tool globs and step limits |
 | `/exit` | leave. Ctrl-C during a turn keeps the session |
 
 ## Tests
@@ -197,13 +254,24 @@ including malformed tool calls, retryable errors and split SSE chunks.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-115 tests cover: verbatim append and tool-call pairing, tool errors as results,
+153 tests (151 offline) cover: verbatim append and tool-call pairing, tool errors as results,
 the step cap, rule precedence, ask-to-deny without a human, always-allow
 persistence, workspace and symlink escapes, edit uniqueness, fold boundaries that
 never split a pair, compaction replay, resume, budget stops, parallel result
-ordering, subagent isolation and depth refusal, MCP discovery through the
-policy, and the one-shot `mh` invocation. `tests/fake_mcp_server.py` is a real
-MCP server over stdio.
+ordering, subagent isolation and depth refusal, agent roles and their tool
+narrowing, parallel subagents (proved with a barrier), MCP discovery through the
+policy, image blocks saved to files, stderr floods and server-initiated requests,
+rounds and stop files, `mh-watch` against live logs, and the one-shot `mh`
+invocation. `tests/fake_mcp_server.py` is a real MCP server over stdio; with
+`--browserish` it behaves like a browser server.
+
+Two more tests drive the real Playwright MCP server, and are skipped unless you
+say how to start it:
+
+```sh
+MH_PLAYWRIGHT_MCP="npx -y @playwright/mcp@latest --headless --isolated" \
+    python3 -m unittest tests.test_playwright_mcp -v
+```
 
 ## Live smoke checklist
 
@@ -225,6 +293,9 @@ Run these by hand in a scratch directory when you change the loop:
 - **A real sandbox.** `run_bash` is contained, not isolated: it runs as you, on
   your machine. This is exactly why it defaults to `ask`. Real isolation needs
   containers or a syscall filter, which is a different project.
+- **Vision.** Screenshots from MCP tools are saved as files, not shown to the
+  model: the client speaks text-only chat completions. Browser checks read the
+  accessibility snapshot instead.
 - **Everything deepseek-harness already does.** No plugin system, no DI, no web
   UI, no multi-provider abstraction, no durable background jobs, no resources or
   notifications beyond MCP tools, no Windows process-group semantics.

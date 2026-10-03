@@ -9,14 +9,17 @@ from . import context, mcp, permissions, session as session_mod, tools as tools_
 from .loop import Harness
 from .model import Model
 from .permissions import PolicyError
-from .subagents import task_tool
+from .subagents import AgentError, load_agents, task_tool
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 STATE_DIR = ".macroharness"
-GITIGNORE = "sessions/\n"
+GITIGNORE = "sessions/\nmcp-media/\n"
 BANNER = ("macro-harness: the loop plus the layers. "
-          "/compact /tokens /session /rules /exit")
+          "/compact /tokens /session /rules /mcp /agents /exit")
+CONTINUE_PROMPT = (
+    "Continue the task from where you left off. If earlier context was "
+    "compacted, re-read your state files before acting.")
 
 
 def build_parser():
@@ -38,6 +41,20 @@ def build_parser():
                         help="use the blocking endpoint instead of SSE")
     parser.add_argument("--non-interactive", action="store_true",
                         help="resolve every 'ask' rule to deny instead of prompting")
+    parser.add_argument("--subagent-max-steps", type=int, default=None,
+                        help="tool rounds per subagent task (default: min(--max-steps, 8)); "
+                             "an agent profile's max_steps overrides it")
+    parser.add_argument("--bash-timeout", type=int, default=60,
+                        help="seconds before run_bash kills a command (default: 60)")
+    parser.add_argument("--prompt-file", default=None,
+                        help="read the one-shot prompt from this file (joined before any "
+                             "trailing prompt words)")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="one-shot mode: after the first turn, send up to N-1 "
+                             "'continue' turns, for long unattended runs (default: 1)")
+    parser.add_argument("--stop-file", default=None,
+                        help="with --rounds: stop before the next turn once this "
+                             "workspace-relative file exists")
     parser.add_argument("prompt", nargs="*",
                         help="one-shot prompt; when omitted, start the REPL")
     return parser
@@ -94,7 +111,13 @@ def build(args, model=None, trust_prompt=None, out=print):
     else:
         session = session_mod.Session.create(sessions_dir)
 
-    containment = tools_mod.Containment(root, env_allow=policy.get("env_allow") or ())
+    try:
+        agents = load_agents(state)
+    except AgentError as error:
+        raise PolicyError(str(error))
+
+    containment = tools_mod.Containment(root, timeout=args.bash_timeout,
+                                        env_allow=policy.get("env_allow") or ())
     registry = tools_mod.default_registry(containment)
 
     on_text = None
@@ -120,8 +143,10 @@ def build(args, model=None, trust_prompt=None, out=print):
         sessions_dir=sessions_dir,
         out=out,
         on_text=on_text,
+        agents=agents,
+        subagent_max_steps=args.subagent_max_steps,
     )
-    registry.register(task_tool(harness.spawn_subagent))
+    registry.register(task_tool(harness.spawn_subagent, agents))
     harness.mcp_servers = mcp.load_servers(
         registry, load_mcp_config(os.path.join(state, "mcp.json")), root, out=out)
     return harness
@@ -147,6 +172,23 @@ def meta(harness, line, out):
         out("policy: %s" % harness.permissions.path)
         for rule in harness.permissions.rules:
             out("  %-5s %-30s %s" % (rule["verb"], rule["tool"], rule["arg"]))
+    elif command == "/mcp":
+        if not harness.mcp_servers:
+            out("no MCP servers running (configure .macroharness/mcp.json)")
+        for server in harness.mcp_servers:
+            out("%s: %d tool(s), timeout %ss" % (
+                server.name, len(server.tool_names), server.timeout))
+            for name in server.tool_names:
+                out("  %s__%s" % (server.name, name))
+    elif command == "/agents":
+        if not harness.agents:
+            out("no agent profiles (add .macroharness/agents/<name>.md)")
+        for name in sorted(harness.agents):
+            agent = harness.agents[name]
+            out("%-14s %s" % (name, agent.description))
+            out("%-14s tools: %s; max_steps: %s" % (
+                "", ", ".join(agent.tools) if agent.tools else "all",
+                agent.max_steps or "default"))
     else:
         out("unknown command %s" % command)
     return False
@@ -174,18 +216,55 @@ def repl(harness, out=print):
     harness.close()
 
 
+def read_prompt(args):
+    parts = []
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file, "r", encoding="utf-8") as handle:
+                parts.append(handle.read().strip())
+        except OSError as error:
+            raise PolicyError("cannot read --prompt-file: %s" % error)
+    parts.append(" ".join(args.prompt).strip())
+    return "\n\n".join(part for part in parts if part)
+
+
+def run_rounds(harness, prompt, rounds=1, stop_file=None):
+    """The one-shot turn, then up to rounds-1 'continue' turns.
+
+    An orchestrator that runs for hours will still end turns now and then (to
+    report, or because it hit --max-steps). Rounds re-enter the same session,
+    so compaction and the log carry over. A stop file is checked before every
+    follow-up, which gives a human a clean way to end a run: `touch` it.
+    """
+    stop_path = os.path.join(harness.root, stop_file) if stop_file else None
+    done = 0
+    text = prompt
+    while done < max(rounds, 1):
+        if done and stop_path and os.path.exists(stop_path):
+            harness.out("[stop file %s exists; ending after %d round(s)]" % (stop_file, done))
+            break
+        if harness._budget_reached():
+            break
+        if done:
+            harness.out("[round %d/%d]" % (done + 1, rounds))
+        harness.run_user_turn(text)
+        done += 1
+        text = CONTINUE_PROMPT
+    return done
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        prompt = read_prompt(args)
         harness = build(args)
     except PolicyError as error:
         sys.exit(str(error))
-    prompt = " ".join(args.prompt).strip()
     if not prompt:
         repl(harness)
         return 0
     try:
-        harness.run_user_turn(prompt)
+        run_rounds(harness, prompt, args.rounds, args.stop_file)
     except KeyboardInterrupt:
         harness.out("\n[turn interrupted; the session is kept]")
     finally:

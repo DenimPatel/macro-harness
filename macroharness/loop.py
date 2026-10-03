@@ -12,6 +12,7 @@ message list looks the same whether the calls ran one at a time or four at once.
 
 import concurrent.futures
 import os
+import threading
 import time
 
 from . import context
@@ -24,7 +25,7 @@ SUBAGENT_MAX_STEPS = 8
 
 SUBAGENT_SYSTEM_PROMPT = (
     "You are a subagent handling one self-contained task.\n"
-    "You have read_file, write_file, edit_file, run_bash and task.\n"
+    "Your tools are: %s.\n"
     "You cannot ask the user anything: any call that would need approval is denied.\n"
     "Read before you write, run what you write, and finish by reporting what you "
     "did and what you verified, in a few lines."
@@ -45,7 +46,7 @@ class Harness:
     def __init__(self, model, registry, permissions, session, accounting, root,
                  system_prompt=MAIN_SYSTEM_PROMPT, max_steps=16, budget=None,
                  interactive=True, sessions_dir=None, out=print, on_text=None,
-                 depth=0):
+                 depth=0, agents=None, subagent_max_steps=None):
         self.model = model
         self.registry = registry
         self.permissions = permissions
@@ -57,11 +58,17 @@ class Harness:
         self.budget = budget
         self.interactive = interactive
         self.sessions_dir = sessions_dir or os.path.join(root, ".macroharness", "sessions")
-        self.out = out
+        # Parallel subagents report from worker threads; one lock keeps each
+        # line whole (print writes the text and the newline separately).
+        self._out_lock = threading.Lock()
+        self.out = self._locked(out)
         self.on_text = on_text
         self.depth = depth
+        self.agents = agents or {}
+        self.subagent_max_steps = subagent_max_steps
         self.mcp_servers = []
         self.sub_count = 0
+        self._sub_lock = threading.Lock()
         self.last_reply = ""
         self.last_steps = 0
         self.last_turn_tokens = 0
@@ -72,6 +79,12 @@ class Harness:
             # session rebuilds byte-identically and fold indexes stay valid.
             self.messages = [{"role": "system", "content": system_prompt}]
             session.append({"t": "system", "text": system_prompt})
+
+    def _locked(self, out):
+        def write(*args):
+            with self._out_lock:
+                out(*args)
+        return write
 
     # --- one user turn ------------------------------------------------------
 
@@ -149,7 +162,10 @@ class Harness:
 
         runnable = [plan for plan in plans if not plan["error"]
                     and plan["tool"] is not None and plan["decision"].allowed]
-        parallel = [plan for plan in runnable if plan["tool"].read_only]
+        # Read-only tools, and tools that declare themselves safe to overlap
+        # (the `task` tool: each subagent has its own context and log).
+        parallel = [plan for plan in runnable
+                    if plan["tool"].read_only or plan["tool"].concurrent]
         if len(parallel) > 1:
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(MAX_PARALLEL_TOOLS, len(parallel))) as pool:
@@ -219,13 +235,42 @@ class Harness:
 
     # --- subagents ----------------------------------------------------------
 
-    def spawn_subagent(self, prompt):
-        """One nested loop with a fresh message list. Depth is capped at 1."""
+    def spawn_subagent(self, prompt, agent=None):
+        """One nested loop with a fresh message list. Depth is capped at 1.
+
+        Recursion is refused twice over: the subagent's registry never holds
+        `task`, so it cannot even see the tool, and a depth-1 harness refuses
+        to spawn if one is called anyway.
+
+        `agent` names a profile from .macroharness/agents/: its tool globs
+        narrow the registry, its body is appended to the system prompt, and its
+        max_steps replaces the default. It cannot touch the policy.
+        """
         if self.depth >= 1:
             return "error: subagents cannot spawn subagents"
-        self.sub_count += 1
+        profile = None
+        if agent:
+            profile = self.agents.get(agent)
+            if profile is None:
+                return "error: unknown agent %r (known: %s)" % (
+                    agent, ", ".join(sorted(self.agents)) or "none")
+        with self._sub_lock:  # parallel task calls race for the next number
+            self.sub_count += 1
+            number = self.sub_count
         sub_session = Session.at(
-            self.sessions_dir, "%s.sub-%d" % (self.session.id, self.sub_count))
+            self.sessions_dir, "%s.sub-%d" % (self.session.id, number))
+        registry = self.registry.subset(
+            profile.tools if profile else None, exclude=("task",))
+        system_prompt = SUBAGENT_SYSTEM_PROMPT % ", ".join(registry.names())
+        if profile is not None and profile.prompt:
+            system_prompt += "\n\nRole: %s\n%s" % (profile.name, profile.prompt)
+        if profile is not None and profile.max_steps:
+            max_steps = profile.max_steps
+        elif self.subagent_max_steps:
+            max_steps = self.subagent_max_steps
+        else:
+            max_steps = min(self.max_steps, SUBAGENT_MAX_STEPS)
+        label = "sub-%d%s" % (number, ":" + agent if agent else "")
         # Same rules, but nobody is there to answer a prompt, so ask is a deny.
         sub_permissions = Permissions(
             self.permissions.policy, self.permissions.path,
@@ -233,24 +278,43 @@ class Harness:
             out=self.permissions.out)
         sub = Harness(
             model=self.model,
-            registry=self.registry,
+            registry=registry,
             permissions=sub_permissions,
             session=sub_session,
             accounting=self.accounting,  # shared: a subagent cannot outspend the parent
             root=self.root,
-            system_prompt=SUBAGENT_SYSTEM_PROMPT,
-            max_steps=min(self.max_steps, SUBAGENT_MAX_STEPS),
+            system_prompt=system_prompt,
+            max_steps=max_steps,
             budget=self.budget,
             interactive=False,  # nobody to ask, so ask resolves to deny
             sessions_dir=self.sessions_dir,
-            out=lambda _line: None,
+            # Tool summaries only, indented: enough to watch a long run, while
+            # the full transcript stays in the subagent's own log.
+            out=lambda line: self.out("    [%s] %s" % (label, line.strip()))
+            if line.startswith("  ") else None,
             on_text=None,
             depth=self.depth + 1,
         )
-        self.out("[subagent] %s" % prompt.strip().splitlines()[0][:100])
-        reply = sub.run_user_turn(prompt)
-        self.out("[subagent] done: %d step(s), %d token(s)"
-                 % (sub.last_steps, sub.last_turn_tokens))
+        first_line = (prompt.strip().splitlines() or [""])[0]
+        self.out("[%s] %s" % (label, first_line[:100]))
+        # Lifecycle events in the parent's log are what `mh-watch` reads from
+        # another terminal: which subagents exist, which are still running,
+        # and where each one's own log is. Replay ignores them.
+        event = {"t": "subagent", "n": number, "agent": agent or "",
+                 "log": os.path.basename(sub_session.path),
+                 "prompt": first_line[:200], "max_steps": max_steps}
+        self.session.append(dict(event, state="running", at=time.time()))
+        try:
+            reply = sub.run_user_turn(prompt)
+        except BaseException as error:
+            self.session.append(dict(event, state="error", at=time.time(),
+                                     error="%s: %s" % (type(error).__name__, error)))
+            raise
+        self.session.append(dict(event, state="done", at=time.time(),
+                                 steps=sub.last_steps, tokens=sub.last_turn_tokens,
+                                 reply=reply[:200]))
+        self.out("[%s] done: %d step(s), %d token(s)"
+                 % (label, sub.last_steps, sub.last_turn_tokens))
         return "%s\n\n(subagent: %d steps, %d tokens)" % (
             reply, sub.last_steps, sub.last_turn_tokens)
 
